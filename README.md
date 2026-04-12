@@ -98,11 +98,10 @@ Offsets are auto-detected by pattern matching. Use `--offset` to override.
 3. Calls the native signing function at `base + offset` with `(cmd, src, src_len, seq, out_buf)`
 4. Parses the 768-byte output buffer: token at `[0x000]`, extra at `[0x100]`, sign at `[0x200]`
 
-## Credits
+## Related Projects
 
-- [nimeng1299/SignServer](https://github.com/nimeng1299/SignServer) — Rust implementation
-- [shixiansi/SingServer](https://github.com/shixiansi/SingServer) — Python reference
-- [LagrangeDev/Lagrange.Core](https://github.com/LagrangeDev/Lagrange.Core) — NTQQ protocol implementation
+- [LagrangeDev/Lagrange.Core](https://github.com/LagrangeDev/Lagrange.Core) — NTQQ protocol implementation (C#)
+- [Micuks/waylay-qq-bridge](https://github.com/Micuks/waylay-qq-bridge) — NTQQ headless bridge with OneBot v11
 
 ## License
 
