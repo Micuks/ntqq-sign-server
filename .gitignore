@@ -1,5 +1,9 @@
 wrapper.node
+wrapper.node.gz
 libsymbols.so
+libvips-cpp.so*
+libbugly.so
+libcrbase.so
 *.o
 __pycache__/
 *.pyc
