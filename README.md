@@ -98,3 +98,16 @@ For unknown versions, specify `--offset` manually or the server will attempt pat
 ## License
 
 AGPL-3.0
+
+## Distribution
+
+For easier distribution, you can bundle a compressed wrapper.node:
+
+```bash
+# Compress (once)
+gzip -k wrapper.node  # creates wrapper.node.gz (43MB vs 132MB)
+
+# Deploy: just ship wrapper.node.gz + sign.py + symbols.c + extract_and_run.sh
+./extract_and_run.sh --port 8080
+```
+
