@@ -75,11 +75,31 @@ Response:
 }
 ```
 
-### App info
+`GET /?cmd=...&seq=...&src=...` is also accepted (same parameters as query string).
+
+### Health, version, and stats
 
 ```
-GET /appinfo
+GET /health      # {"status":"ok", "uptime_seconds":..., "platform":..., "version":...}
+GET /appinfo     # {"platform":..., "version":...}
+GET /stats       # {"uptime_seconds":..., "call_count":..., "avg_native_ms":...}
 ```
+
+`/health` is wired into the Docker `HEALTHCHECK` — if the native call breaks,
+the container is reported unhealthy.
+
+## Integration tests
+
+```bash
+# In one shell
+python3 sign.py --wrapper ./wrapper.node --port 8080
+
+# In another
+python3 test_sign.py --url http://127.0.0.1:8080
+```
+
+The suite covers endpoint handlers, malformed input (bad JSON, bad hex, missing
+`cmd`), and 10 concurrent sign requests (validates the native-call lock).
 
 ## Supported QQ Versions
 
@@ -97,6 +117,16 @@ Offsets are auto-detected by pattern matching. Use `--offset` to override.
 2. `dl_iterate_phdr()` finds the module base address
 3. Calls the native signing function at `base + offset` with `(cmd, src, src_len, seq, out_buf)`
 4. Parses the 768-byte output buffer: token at `[0x000]`, extra at `[0x100]`, sign at `[0x200]`
+
+Native calls are serialized with a mutex — `wrapper.node` carries global VM and
+PRNG state, so concurrent invocations produce garbage. HTTP handling itself is
+threaded (via `ThreadingMixIn`) so parallel clients still benefit from
+overlapped request parsing and response writing.
+
+On startup the server issues one `sign("wtlogin.login", 1, b"\x00")` call as a
+self-test. Any failure (missing preload deps, wrong offset, broken
+`wrapper.node`) aborts the process before the port is opened, so orchestrators
+never see a zombie container.
 
 ## Related Projects
 
