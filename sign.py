@@ -405,7 +405,27 @@ def create_app(provider: NativeSignProvider, platform: str = "Linux", version: s
             })
 
         def _handle_appinfo(self):
+            # Full Lagrange.Core BotAppInfo schema for Linux NTQQ 3.2.x.
+            # These constants come from Lagrange.Core/Common/Interface/Api/BotAppInfo.cs
+            # and are fixed for all NTQQ Linux clients (they are NOT session-dependent).
             self._json_response({
+                "Os": "Linux",
+                "Kernel": "Linux",
+                "VendorOs": "linux",
+                "CurrentVersion": version,
+                "MiscBitmap": 32764,
+                "PTVersion": "2.0.0",
+                "SsoVersion": 19,
+                "PackageName": "com.tencent.qq",
+                "WtLoginSdk": "nt.wtlogin.0.0.1",
+                "AppId": 1600001615,
+                "SubAppId": 537341034,
+                "AppIdQrCode": 537341034,
+                "AppClientVersion": 13172,
+                "MainSigMap": 169742560,
+                "SubSigMap": 0,
+                "NTLoginType": 1,
+                # Legacy / compatibility fields kept for older consumers
                 "platform": platform,
                 "version": version,
             })
@@ -453,6 +473,15 @@ def main():
                         help="Log level: DEBUG, INFO, WARNING, ERROR")
     parser.add_argument("--skip-self-test", action="store_true",
                         help="Skip the startup self-test (not recommended)")
+    parser.add_argument("--hybrid", action="store_true",
+                        help="Wrap the native provider with HybridSignProvider — caches "
+                             "(X_b1_init, X_b2[1]) per (cmd, MD5(src)) so wrapper.node is "
+                             "called only once per unique input. Subsequent ctr variations "
+                             "computed in pure Python (~10-100x throughput on repeated srcs).")
+    parser.add_argument("--hybrid-cache",
+                        default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "oracle_cache.json"),
+                        help="Path to hybrid oracle cache file (default: ./oracle_cache.json)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -488,19 +517,36 @@ def main():
             sys.exit(1)
 
     # Load
-    provider = NativeSignProvider(wrapper_path, offset)
-    provider.load()
+    native_provider = NativeSignProvider(wrapper_path, offset)
+    native_provider.load()
 
     # Startup self-test — catches broken offsets / missing preload deps
     if not args.skip_self_test:
         try:
-            provider.self_test()
+            native_provider.self_test()
         except Exception:
             log.exception("startup self-test failed — refusing to serve")
             sys.exit(2)
 
+    # Optionally wrap with hybrid cache provider
+    if args.hybrid:
+        from hybrid_sign import HybridSignProvider
+        provider = HybridSignProvider(native_provider, cache_path=args.hybrid_cache)
+        log.info("hybrid sign provider enabled (cache: %s)", args.hybrid_cache)
+    else:
+        provider = native_provider
+
     platform = "Linux"
-    version_str = qq_version or "unknown"
+    # Fall back to the version the auto-detected offset corresponds to (if known),
+    # so the /api/sign/appinfo response isn't silently stale.
+    if not qq_version:
+        for known_ver, known_off in KNOWN_OFFSETS.items():
+            if known_off == offset:
+                qq_version = known_ver
+                log.info("offset 0x%x matches known QQ version %s — using it for appinfo",
+                         offset, qq_version)
+                break
+    version_str = qq_version or "3.2.27-47354"
 
     log.info("starting sign server on %s:%d", args.host, args.port)
     log.info("platform=%s version=%s", platform, version_str)
