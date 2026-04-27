@@ -103,7 +103,7 @@ def execute_step(state, ib):
         src_a = state[b2] if b2 < NREGS else 0
         src_b = state[b3] if b3 < NREGS else 0
         try:
-            v = eval_formula(formula, state, b1, b2, b3, src_a, src_b)
+            v = eval_formula(formula, state, b1, b2, b3, src_a, src_b, target)
         except Exception:
             return False
         if v is None:
@@ -139,8 +139,9 @@ def execute_step(state, ib):
     return False
 
 
-def eval_formula(formula, state, b1, b2, b3, src_a, src_b):
-    target = b1 if b1 < NREGS else None
+def eval_formula(formula, state, b1, b2, b3, src_a, src_b, target=None):
+    if target is None:
+        target = b1 if b1 < NREGS else None
     if formula == 'target = b3': return b3
     if formula == 'target = b2': return b2
     if formula == 'target = b3 - b2': return (b3 - b2) & MASK
@@ -168,9 +169,9 @@ def eval_formula(formula, state, b1, b2, b3, src_a, src_b):
     if formula == 'target = ~src_a': return (~src_a) & MASK
     if formula == 'target = -src_a': return (-src_a) & MASK
     if formula == 'target = sign_ext_8(src_a)':
-        return ((src_a & 0xFF) ^ 0x80) - 0x80 & MASK
+        return (((src_a & 0xFF) ^ 0x80) - 0x80) & MASK
     if formula == 'target = sign_ext_16(src_a)':
-        return ((src_a & 0xFFFF) ^ 0x8000) - 0x8000 & MASK
+        return (((src_a & 0xFFFF) ^ 0x8000) - 0x8000) & MASK
     if formula == 'target = sign_ext_8(b3)' and b3 < NREGS:
         return ((state[b3] & 0xFF) ^ 0x80) - 0x80 & MASK
     if formula == 'target = sign_ext_8(b2)' and b2 < NREGS:
