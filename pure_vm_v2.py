@@ -79,6 +79,33 @@ def _load_solved():
             if ib not in handlers:
                 handlers[ib] = ('formula', formula, target)
 
+    # Advanced tables: BYTE_TABLE / ADD_TABLE / XOR_TABLE
+    tv3 = _open('learned_tables_v3.json') or _open('tables_v3.json')
+    if tv3:
+        for ib_str, info in tv3.items():
+            ib = eval(ib_str)
+            kind = info[0]
+            if ib in handlers:
+                continue
+            if kind == 'BYTE_TABLE':
+                target = info[1]
+                idx_reg = info[2]
+                shift = info[3]
+                table = {int(k): v for k, v in info[4].items()}
+                handlers[ib] = ('BYTE_TABLE', target, idx_reg, shift, table)
+            elif kind == 'ADD_TABLE':
+                target = info[1]
+                r1 = info[2]
+                r2 = info[3]
+                table = {int(k): v for k, v in info[4].items()}
+                handlers[ib] = ('ADD_TABLE', target, r1, r2, table)
+            elif kind == 'XOR_TABLE':
+                target = info[1]
+                r1 = info[2]
+                r2 = info[3]
+                table = {int(k): v for k, v in info[4].items()}
+                handlers[ib] = ('XOR_TABLE', target, r1, r2, table)
+
     return handlers
 
 
@@ -131,11 +158,32 @@ def execute_step(state, ib):
     elif kind == 'SBOX':
         idx_reg = handler[1]
         target = b1
-        # Look up in custom_sbox
-        sbox = SBOX
+        if SBOX is None:
+            return False
         idx = state[idx_reg] & 0xFF
-        state[target] = sbox[idx]
+        state[target] = SBOX[idx]
         return True
+    elif kind == 'BYTE_TABLE':
+        target, idx_reg, shift, table = handler[1], handler[2], handler[3], handler[4]
+        idx = (state[idx_reg] >> shift) & 0xFF
+        if idx in table:
+            state[target] = table[idx]
+            return True
+        return False
+    elif kind == 'ADD_TABLE':
+        target, r1, r2, table = handler[1], handler[2], handler[3], handler[4]
+        idx = (state[r1] + state[r2]) & 0xFF
+        if idx in table:
+            state[target] = table[idx]
+            return True
+        return False
+    elif kind == 'XOR_TABLE':
+        target, r1, r2, table = handler[1], handler[2], handler[3], handler[4]
+        idx = (state[r1] ^ state[r2]) & 0xFF
+        if idx in table:
+            state[target] = table[idx]
+            return True
+        return False
     return False
 
 
