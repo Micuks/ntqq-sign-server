@@ -79,6 +79,15 @@ def _load_solved():
             if ib not in handlers:
                 handlers[ib] = ('formula', formula, target)
 
+    # SBOX-shift patterns (5 patterns)
+    ss = _open('learned_sbox_shift.json') or _open('sbox_shift.json')
+    if ss:
+        for ib_str, info in ss.items():
+            ib = eval(ib_str)
+            if ib in handlers:
+                continue
+            handlers[ib] = tuple(info)
+
     # Advanced tables: BYTE_TABLE / ADD_TABLE / XOR_TABLE
     tv3 = _open('learned_tables_v3.json') or _open('tables_v3.json')
     if tv3:
@@ -184,6 +193,25 @@ def execute_step(state, ib):
             state[target] = table[idx]
             return True
         return False
+    elif kind == 'SBOX_SHIFT':
+        target, idx_reg, sh_in, sh_out = handler[1], handler[2], handler[3], handler[4]
+        if SBOX is None: return False
+        idx = (state[idx_reg] >> sh_in) & 0xFF
+        state[target] = (SBOX[idx] << sh_out) & MASK
+        return True
+    elif kind == 'SBOX_BYTE_INSERT':
+        target, idx_reg, sh_in, sh_out = handler[1], handler[2], handler[3], handler[4]
+        if SBOX is None: return False
+        bm = ~(0xFF << sh_out) & MASK
+        idx = (state[idx_reg] >> sh_in) & 0xFF
+        state[target] = ((state[target] & bm) | ((SBOX[idx] & 0xFF) << sh_out)) & MASK
+        return True
+    elif kind == 'SBOX_XOR_INTO':
+        target, idx_reg, sh_in, sh_out = handler[1], handler[2], handler[3], handler[4]
+        if SBOX is None: return False
+        idx = (state[idx_reg] >> sh_in) & 0xFF
+        state[target] = (state[target] ^ ((SBOX[idx] & 0xFF) << sh_out)) & MASK
+        return True
     return False
 
 
