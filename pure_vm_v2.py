@@ -9,7 +9,7 @@ import json
 import hashlib
 import os
 
-NREGS = 150
+NREGS = 300
 MASK = 0xFFFFFFFF
 
 
@@ -387,9 +387,13 @@ def replay_trace(trace):
 
 
 if __name__ == '__main__':
-    # Test against trace 0
+    # Test against trace 0 (prefer extended-reg trace if available)
     print("Loading trace...")
-    trace = json.load(open('/tmp/multi_trace_00.json'))
+    if os.path.exists('/tmp/multi_ext_00.json'):
+        trace = json.load(open('/tmp/multi_ext_00.json'))
+        print('  using NREGS=300 multi_ext_00')
+    else:
+        trace = json.load(open('/tmp/multi_trace_00.json'))
     
     print(f"Replaying {len(trace)} steps...")
     results = replay_trace(trace)
