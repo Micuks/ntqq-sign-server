@@ -148,7 +148,47 @@ def execute_step(state, ib, step=None):
         if step is None or step not in step_map:
             return False
         sol = step_map[step]
-        sub_kind, target, idx_reg, sh_in, sh_out = sol
+        sub_kind = sol[0]
+        target = sol[1]
+        if sub_kind == 'R':
+            x = sol[2]
+            state[target] = state[x]
+            return True
+        elif sub_kind == 'XOR2':
+            x, y = sol[2], sol[3]
+            state[target] = (state[x] ^ state[y]) & MASK
+            return True
+        elif sub_kind == 'XOR_ACC':
+            x = sol[2]
+            state[target] = (state[target] ^ state[x]) & MASK
+            return True
+        elif sub_kind == 'OR_SHIFT':
+            x, y, sh = sol[2], sol[3], sol[4]
+            state[target] = (state[x] | ((state[y] << sh) & MASK)) & MASK
+            return True
+        elif sub_kind == 'BYTE_MERGE':
+            x, y, sh = sol[2], sol[3], sol[4]
+            m = (0xFF << sh) & MASK
+            state[target] = ((state[x] & ~m & MASK) | (state[y] & m)) & MASK
+            return True
+        elif sub_kind == 'ROTL':
+            x, n = sol[2], sol[3]
+            state[target] = rotl32(state[x], n)
+            return True
+        elif sub_kind == 'AND_CONST':
+            x, c = sol[2], sol[3]
+            state[target] = state[x] & c
+            return True
+        elif sub_kind == 'ADD2':
+            x, y = sol[2], sol[3]
+            state[target] = (state[x] + state[y]) & MASK
+            return True
+        elif sub_kind == 'XOR3':
+            x, y, z = sol[2], sol[3], sol[4]
+            state[target] = (state[x] ^ state[y] ^ state[z]) & MASK
+            return True
+        # SBOX-related kinds keep idx_reg, sh_in, sh_out structure
+        idx_reg, sh_in, sh_out = sol[2], sol[3], sol[4]
         if SBOX is None:
             return False
         idx = (state[idx_reg] >> sh_in) & 0xFF
