@@ -88,6 +88,15 @@ def _load_solved():
                 continue
             handlers[ib] = tuple(info)
 
+    # Per-step SBOX formulas (for ib patterns where formula varies by step)
+    pss = _open('per_step_sbox.json')
+    if pss:
+        for ib_str, step_map in pss.items():
+            ib = eval(ib_str)
+            # Convert step keys to int
+            tbl = {int(s): tuple(sol) for s, sol in step_map.items()}
+            handlers[ib] = ('PER_STEP_SBOX', tbl)
+
     # Advanced tables: BYTE_TABLE / ADD_TABLE / XOR_TABLE
     tv3 = _open('learned_tables_v3.json') or _open('tables_v3.json')
     if tv3:
@@ -122,14 +131,37 @@ HANDLERS = _load_solved()
 print(f"Loaded {len(HANDLERS)} opcode handlers.")
 
 
-def execute_step(state, ib):
-    """Execute one VM step. Returns True if op was handled, False if unknown."""
+def execute_step(state, ib, step=None):
+    """Execute one VM step. Returns True if op was handled, False if unknown.
+
+    `step` is the VM step index (used for per-step opcodes like PER_STEP_SBOX).
+    """
     op, b1, b2, b3 = ib
     key = tuple(ib)
     if key not in HANDLERS:
         return False
     handler = HANDLERS[key]
     kind = handler[0]
+
+    if kind == 'PER_STEP_SBOX':
+        step_map = handler[1]
+        if step is None or step not in step_map:
+            return False
+        sol = step_map[step]
+        sub_kind, target, idx_reg, sh_in, sh_out = sol
+        if SBOX is None:
+            return False
+        idx = (state[idx_reg] >> sh_in) & 0xFF
+        if sub_kind == 'SBOX_SHIFT':
+            state[target] = (SBOX[idx] << sh_out) & MASK
+        elif sub_kind == 'SBOX_BYTE_INSERT':
+            bm = ~(0xFF << sh_out) & MASK
+            state[target] = ((state[target] & bm) | ((SBOX[idx] & 0xFF) << sh_out)) & MASK
+        elif sub_kind == 'SBOX_XOR_INTO':
+            state[target] = (state[target] ^ ((SBOX[idx] & 0xFF) << sh_out)) & MASK
+        else:
+            return False
+        return True
 
     if kind == 'NOP':
         return True
@@ -296,8 +328,7 @@ def replay_trace(trace):
         expected = trace[s+1][2]
         
         # Apply handler
-        prev_state = list(state)
-        ok = execute_step(state, ib)
+        ok = execute_step(state, ib, step=s)
         
         if not ok:
             results.append((s, 'MISS', ib))
