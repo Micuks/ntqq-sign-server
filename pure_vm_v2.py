@@ -187,6 +187,34 @@ def execute_step(state, ib, step=None):
             x, y, z = sol[2], sol[3], sol[4]
             state[target] = (state[x] ^ state[y] ^ state[z]) & MASK
             return True
+        elif sub_kind == 'SHIFT_OR':
+            x, sh, y, hi = sol[2], sol[3], sol[4], sol[5]
+            state[target] = (((state[x] >> sh) & ((1 << hi) - 1)) | ((state[y] << hi) & MASK)) & MASK
+            return True
+        elif sub_kind == 'HW_MERGE_HI_LO':
+            x, y = sol[2], sol[3]
+            state[target] = ((state[x] & 0xFFFF0000) | (state[y] & 0xFFFF)) & MASK
+            return True
+        elif sub_kind == 'HW_MERGE_LO_HI':
+            x, y = sol[2], sol[3]
+            state[target] = ((state[x] & 0xFFFF) | (state[y] & 0xFFFF0000)) & MASK
+            return True
+        elif sub_kind == 'SHIFT_R':
+            x, sh = sol[2], sol[3]
+            state[target] = (state[x] >> sh) & MASK
+            return True
+        elif sub_kind == 'SHIFT_L':
+            x, sh = sol[2], sol[3]
+            state[target] = (state[x] << sh) & MASK
+            return True
+        elif sub_kind == 'XOR_CONST':
+            x, c = sol[2], sol[3]
+            state[target] = (state[x] ^ c) & MASK
+            return True
+        elif sub_kind == 'ADD_CONST':
+            x, c = sol[2], sol[3]
+            state[target] = (state[x] + c) & MASK
+            return True
         # SBOX-related kinds keep idx_reg, sh_in, sh_out structure
         idx_reg, sh_in, sh_out = sol[2], sol[3], sol[4]
         if SBOX is None:
