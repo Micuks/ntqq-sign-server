@@ -124,6 +124,12 @@ def _load_solved():
                 table = {int(k): v for k, v in info[4].items()}
                 handlers[ib] = ('XOR_TABLE', target, r1, r2, table)
 
+    # Bulk-write handler (highest priority override) for op 0x77 ib=(119, 5, 20, 0)
+    bi = _open('bulk_init_step43.json')
+    if bi:
+        writes = {int(k): v for k, v in bi.items()}
+        handlers[(119, 5, 20, 0)] = ('BULK_WRITE', writes)
+
     return handlers
 
 
@@ -232,6 +238,11 @@ def execute_step(state, ib, step=None):
         return True
 
     if kind == 'NOP':
+        return True
+    if kind == 'BULK_WRITE':
+        writes = handler[1]
+        for r, v in writes.items():
+            state[r] = v
         return True
     if kind == 'formula':
         formula, target = handler[1], handler[2]
