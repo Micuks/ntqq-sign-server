@@ -207,8 +207,15 @@ def stub_handle(uc, plt_va):
     uc.reg_write(UC_X86_REG_RSP, rsp + 8)
     uc.reg_write(UC_X86_REG_RIP, ret_addr)
 
+last_jump_log = []
 def hook_code(uc, address, size, user_data):
     exec_count[0] += 1
+    # Log if RIP is suspiciously low
+    if address < 0x10000:
+        rsp = uc.reg_read(UC_X86_REG_RSP)
+        last_jump_log.append((exec_count[0], address, rsp))
+        if len(last_jump_log) > 5:
+            uc.emu_stop()
     # Detect PLT entry execution
     if PLT_LO_VA <= address < PLT_HI_VA:
         stub_handle(uc, address)
@@ -248,41 +255,67 @@ import time
 print(f"\nStarting at RIP=0x{regs['rip']:x}")
 t0 = time.time()
 try:
-    mu.emu_start(regs['rip'], 0, count=10000000)
+    mu.emu_start(regs['rip'], 0xffffffffffffffff, count=10000000)
     print(f"Finished after {time.time()-t0:.2f}s, executed {exec_count[0]} instructions")
     final_rip = mu.reg_read(UC_X86_REG_RIP)
     print(f"  Final RIP: 0x{final_rip:x}")
-    # Try to find the sign output in stack/buffers. Native sign returns 32 bytes.
-    # The expected output for src=0 is e957228a... per the captured run.
-    expected_sig = bytes.fromhex('e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f')
-    # Search captured ranges for the sign output bytes
-    found = []
-    for rng_addr, rng_end, _ in [(0x400000, 0xffffffffffffff, 7)]: pass
-    # Just dump the captured stack region around where ops would write
-    rsp_orig = regs['rsp']
-    print(f"  Reading stack 0x{rsp_orig-0x100:x}-0x{rsp_orig+0x300:x}:")
-    stack_now = bytes(mu.mem_read(rsp_orig - 0x100, 0x400))
-    # Search for any 32-byte slice matching expected sig
-    if expected_sig in stack_now:
-        idx = stack_now.find(expected_sig)
-        print(f"  ✅ Found expected sign at stack offset {idx} (VA 0x{rsp_orig - 0x100 + idx:x})")
-    else:
-        # Search wider — heap region 0x22dd000-0x24b2000
+    print(f"  Last low-RIP jumps: {last_jump_log}")
+    # Search for X_b1_init[0]=0x114D0B11 in post-emulation memory.
+    # If present, op 0x60 successfully wrote the cipher init state.
+    target = 0x114D0B11
+    pat = struct.pack('<I', target)
+    found_xb1 = []
+    for rng in m['ranges']:
         try:
-            heap = bytes(mu.mem_read(0x22dd000, 0x1d5000))
-            if expected_sig in heap:
-                idx = heap.find(expected_sig)
-                print(f"  ✅ Found in heap at offset {idx} (VA 0x{0x22dd000 + idx:x})")
+            d = bytes(mu.mem_read(rng['addr'], rng['size']))
+            pos = 0
+            while True:
+                idx = d.find(pat, pos)
+                if idx < 0: break
+                found_xb1.append(rng['addr'] + idx)
+                pos = idx + 1
+        except UcError: pass
+    print(f"  X_b1_init[0]=0x114D0B11 found at {len(found_xb1)} positions: {[hex(x) for x in found_xb1[:10]]}")
+
+    # If found, dump X_b1_init[0..3] and X_b2_init[1] from those locations
+    expected_xb1_for_src0 = [0x114D0B11, 0xAFFC818B, 0xFC57448F, 0x011D0687]
+    expected_xb2_1 = 0x8DBF308F
+    for va in found_xb1:
+        try:
+            xb1 = struct.unpack('<4I', bytes(mu.mem_read(va, 16)))
+            if list(xb1) == expected_xb1_for_src0:
+                print(f"  ✅ EXACT MATCH for X_b1_init at VA 0x{va:x}: {[hex(x) for x in xb1]}")
             else:
-                print(f"  ❌ Expected sign NOT found in stack or heap")
-                # Also search shorter prefix
-                for pl in [16, 8, 4]:
-                    if expected_sig[:pl] in stack_now:
-                        idx = stack_now.find(expected_sig[:pl])
-                        print(f"     Found {pl}-byte prefix at stack offset {idx}")
-                        break
-        except Exception as e:
-            print(f"  Error searching: {e}")
+                print(f"     X_b1[0..3] at 0x{va:x}: {[hex(x) for x in xb1]}")
+        except: pass
+
+    # Compare entire memory before/after emulation. Bytes that DIFFER are what
+    # our emulation wrote. If hash output is among them, it appears as new bytes
+    # in heap/stack regions.
+    expected_sig = bytes.fromhex('e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f')
+    sig_locations_after = []
+    sig_locations_before = []
+    for rng in m['ranges']:
+        try:
+            d_after = bytes(mu.mem_read(rng['addr'], rng['size']))
+            d_before = open(rng['file'], 'rb').read()
+            pos = 0
+            while True:
+                idx = d_after.find(expected_sig, pos)
+                if idx < 0: break
+                sig_locations_after.append(rng['addr'] + idx)
+                pos = idx + 1
+            pos = 0
+            while True:
+                idx = d_before.find(expected_sig, pos)
+                if idx < 0: break
+                sig_locations_before.append(rng['addr'] + idx)
+                pos = idx + 1
+        except UcError: pass
+    new_sig_locs = set(sig_locations_after) - set(sig_locations_before)
+    print(f"  Expected sign in memory BEFORE emulation: {len(sig_locations_before)} locations: {[hex(x) for x in sig_locations_before]}")
+    print(f"  Expected sign in memory AFTER emulation:  {len(sig_locations_after)} locations: {[hex(x) for x in sig_locations_after]}")
+    print(f"  NEW locations (only after emulation): {len(new_sig_locs)}: {[hex(x) for x in new_sig_locs]}")
 except UcError as e:
     print(f"  UcError after {time.time()-t0:.2f}s, executed {exec_count[0]}: {e}")
     rip = mu.reg_read(UC_X86_REG_RIP)
