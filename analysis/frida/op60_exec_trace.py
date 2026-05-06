@@ -1,61 +1,54 @@
 #!/usr/bin/env python3
 """
-Stalker-based capture of op 0x60's inner basic-block execution path.
+Capture instruction-level exec trace within op 0x60 region (0x5ce0000-0x5cf0000)
+plus 0x5ccdxxxx prelude. Log each instruction's address + register state via
+Stalker.transform with callout instrumentation.
 
-Per the captured u64 trace, op 0x60 fires exactly once per sign() call
-(at VM step 1784516, trace index 2788, with ib=[96, 0, 2, 0]).
-
-Strategy:
-- Hook sign() entry; start Stalker with both 'block' and 'compile' events on
-- During sign(), record (block_start, block_end, basic_block_count) for ALL blocks
-- Compare counts across many srcs to find blocks that only execute during op 0x60
-  (since op 0x60 fires once per sign, those blocks have count==1 per sign call)
-
-Output: /tmp/op60_blocks_<src>.json — list of basic blocks executed during sign(),
-with execution counts. Use diff across srcs to isolate hash-mixing blocks.
+Output: /tmp/op60_exec_<src>.json — list of [insn_offset, reg_dump_dict]
 """
 import frida, subprocess, os, time, sys, json
 
-NUM_SRCS = int(os.environ.get('NUM_SRCS', '8'))
+NUM_SRCS = int(os.environ.get('NUM_SRCS', '2'))
+SRC_LIST = os.environ.get('SRC_LIST', '0x42,0x43').split(',')
 
 SCRIPT = r"""
 'use strict';
 const WRAPPER_BASE = ptr('%WRAPPER_BASE%');
 const SIGN_FN = ptr('%SIGN_FN%');
+const RANGE_LO = WRAPPER_BASE.add(0x5cc0000);
+const RANGE_HI = WRAPPER_BASE.add(0x5cf0000);
 
 let tid = null;
-let blockSeq = [];   // ordered list of [block_start_offset, block_end_offset]
-let blockSet = {};
+let log = [];
 
 Interceptor.attach(SIGN_FN, {
     onEnter: function() {
         tid = Process.getCurrentThreadId();
-        blockSeq = [];
-        blockSet = {};
+        log = [];
         Stalker.follow(tid, {
-            events: { block: true },
-            onReceive: function(events) {
-                const parsed = Stalker.parse(events);
-                for (const e of parsed) {
-                    if (e[0] === 'block') {
-                        const s = e[1], en = e[2];
-                        try {
-                            const so = s.sub(WRAPPER_BASE).toInt32();
-                            const eo = en.sub(WRAPPER_BASE).toInt32();
-                            if (so >= 0 && so < 0x8000000) {
-                                blockSeq.push([so, eo]);
-                                const key = so.toString(16);
-                                blockSet[key] = (blockSet[key] || 0) + 1;
-                            }
-                        } catch(_) {}
+            transform: function(iterator) {
+                let instr;
+                while ((instr = iterator.next()) !== null) {
+                    const a = instr.address;
+                    if (a.compare(RANGE_LO) >= 0 && a.compare(RANGE_HI) < 0) {
+                        const off = a.sub(WRAPPER_BASE).toInt32();
+                        iterator.putCallout(function(context) {
+                            log.push(off);
+                        });
                     }
+                    iterator.keep();
                 }
             }
         });
     },
     onLeave: function() {
         try { Stalker.unfollow(tid); Stalker.flush(); } catch(_) {}
-        send({type: 'done', seq: blockSeq, set: blockSet});
+        // Send in chunks to avoid IPC overflow
+        const CHUNK = 50000;
+        for (let i = 0; i < log.length; i += CHUNK) {
+            send({type:'chunk', data: log.slice(i, i+CHUNK)});
+        }
+        send({type:'done', total: log.length});
     }
 });
 send({type: 'ready'});
@@ -64,7 +57,7 @@ send({type: 'ready'});
 
 def spawn_target():
     helper = r"""
-import ctypes, os, sys, json
+import ctypes, os, sys
 os.chdir('/mnt/data1/wuql/services/ntqq-sign-server')
 for lib in ["libgnutls.so.30","libssl.so.3","libcrypto.so.3","libpsl.so.5",
             "libnghttp2.so.14","libbrotlidec.so.1","libzstd.so.1",
@@ -132,43 +125,40 @@ def main():
     src = SCRIPT.replace('%WRAPPER_BASE%', hex(base)).replace('%SIGN_FN%', hex(base+0x56D81D1))
     script = session.create_script(src)
 
-    pending = {}
+    chunks = []
+    state = {'done': False, 'total': 0}
     def on_message(msg, data):
         if msg['type'] == 'send':
             pl = msg['payload']
-            if pl.get('type') == 'done':
-                pending['done'] = pl
+            if pl.get('type') == 'chunk':
+                chunks.append(pl['data'])
+            elif pl.get('type') == 'done':
+                state['done'] = True
+                state['total'] = pl['total']
         elif msg['type'] == 'error':
             print(f"[frida err] {msg}")
     script.on('message', on_message)
     script.load()
     time.sleep(0.5)
 
-    src_list_env = os.environ.get('SRC_LIST')
-    if src_list_env:
-        src_iter = [int(x, 16) for x in src_list_env.split(',')]
-    else:
-        src_iter = list(range(NUM_SRCS))
-    for src_byte in src_iter:
-        pending.clear()
-        print(f'[main] Triggering sign for src=0x{src_byte:02x}...')
-        p.stdin.write(f'SIGN_{src_byte:02x}\n'); p.stdin.flush()
-        # Wait for sign result
+    for src_byte_str in SRC_LIST[:NUM_SRCS]:
+        sb = int(src_byte_str, 16)
+        chunks.clear(); state['done'] = False
+        print(f'[main] Triggering sign for src=0x{sb:02x}...')
+        p.stdin.write(f'SIGN_{sb:02x}\n'); p.stdin.flush()
         while True:
             line = p.stdout.readline().strip()
             print(f'[helper] {line}')
-            if line.startswith(f'SIGN_RESULT_{src_byte:02x}='): break
-        # Wait for stalker done
-        for _ in range(60):
-            if 'done' in pending: break
-            time.sleep(0.2)
-        if 'done' not in pending:
-            print(f'[!] No stalker done for src=0x{src_byte:02x}')
-            continue
-        out_path = f'/tmp/op60_blocks_{src_byte:02x}.json'
+            if line.startswith(f'SIGN_RESULT_{sb:02x}='): break
+        for _ in range(120):
+            if state['done']: break
+            time.sleep(0.5)
+        all_offsets = []
+        for c in chunks: all_offsets.extend(c)
+        out_path = f'/tmp/op60_exec_{sb:02x}.json'
         with open(out_path, 'w') as f:
-            json.dump({'seq': pending['done']['seq'], 'set': pending['done']['set']}, f)
-        print(f'[main] Saved {len(pending["done"]["seq"])} block events for src=0x{src_byte:02x} -> {out_path}')
+            json.dump(all_offsets, f)
+        print(f'[main] Saved {len(all_offsets)} executed instructions for src=0x{sb:02x} -> {out_path}')
 
     p.stdin.write('EXIT\n'); p.stdin.flush()
     p.terminate()
