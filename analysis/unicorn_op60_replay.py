@@ -74,7 +74,10 @@ print(f"\nMapped {ok} captured ranges, {skip} overlap wrapper, {fail} failed")
 # FS region for canary - allocate enough room for negative offsets too
 FS_VA = 0x70000000
 mu.mem_map(FS_VA - 0x10000, 0x20000, UC_PROT_READ | UC_PROT_WRITE)
-mu.mem_write(FS_VA + 0x28, struct.pack('<Q', 0xCAFEBABEDEADBEEF))
+# Read the actual stored canary from captured stack memory at sign() prologue [rbp]
+# Locate it by scanning for non-zero qword in early stack region (canary is fixed per-thread)
+canary_value = 0xf2a9867f0bf2b700  # captured at [rsp+0x30] in this dump
+mu.mem_write(FS_VA + 0x28, struct.pack('<Q', canary_value))
 mu.reg_write(UC_X86_REG_FS_BASE, FS_VA)
 
 # Restore registers
@@ -149,6 +152,50 @@ def stub_handle(uc, plt_va):
             if uc.mem_read(rdi + sz, 1)[0] == 0: break
             sz += 1
         ret_val = sz
+    elif name == '_ZNSt6vectorIlSaIlEE12emplace_backIJRlEEES3_DpOT_':
+        # std::vector<long>::emplace_back(long&)
+        # rdi = this, rsi = ptr to value to insert
+        this_ptr = rdi
+        val_ptr = rsi
+        val = struct.unpack('<q', bytes(uc.mem_read(val_ptr, 8)))[0]
+        begin = struct.unpack('<Q', bytes(uc.mem_read(this_ptr, 8)))[0]
+        end = struct.unpack('<Q', bytes(uc.mem_read(this_ptr+8, 8)))[0]
+        cap = struct.unpack('<Q', bytes(uc.mem_read(this_ptr+16, 8)))[0]
+        size = (end - begin) // 8 if begin else 0
+        capacity = (cap - begin) // 8 if begin else 0
+        if size < capacity:
+            # In-place insert
+            uc.mem_write(end, struct.pack('<q', val))
+            uc.mem_write(this_ptr+8, struct.pack('<Q', end+8))
+        else:
+            # Reallocate
+            new_cap = max(capacity * 2, 4)
+            new_buf = alloc(new_cap * 8)
+            if begin and size:
+                old_data = bytes(uc.mem_read(begin, size*8))
+                uc.mem_write(new_buf, old_data)
+            uc.mem_write(new_buf + size*8, struct.pack('<q', val))
+            uc.mem_write(this_ptr, struct.pack('<Q', new_buf))
+            uc.mem_write(this_ptr+8, struct.pack('<Q', new_buf + (size+1)*8))
+            uc.mem_write(this_ptr+16, struct.pack('<Q', new_buf + new_cap*8))
+        ret_val = uc.reg_read(UC_X86_REG_RAX)  # don't care
+    elif name == '_ZNSt6vectorIlSaIlEE17_M_realloc_insertIJRlEEEvN9__gnu_cxx17__normal_iteratorIPlS1_EEDpOT_':
+        # std::vector<long>::_M_realloc_insert(iterator pos, long&) — same logic, simplified
+        this_ptr = rdi
+        # rsi = iterator (pointer), rdx = ptr to value
+        val_ptr = rdx
+        val = struct.unpack('<q', bytes(uc.mem_read(val_ptr, 8)))[0]
+        begin = struct.unpack('<Q', bytes(uc.mem_read(this_ptr, 8)))[0]
+        end = struct.unpack('<Q', bytes(uc.mem_read(this_ptr+8, 8)))[0]
+        size = (end - begin) // 8 if begin else 0
+        new_cap = max(size * 2, 4)
+        new_buf = alloc(new_cap * 8)
+        if begin and size: uc.mem_write(new_buf, bytes(uc.mem_read(begin, size*8)))
+        uc.mem_write(new_buf + size*8, struct.pack('<q', val))
+        uc.mem_write(this_ptr, struct.pack('<Q', new_buf))
+        uc.mem_write(this_ptr+8, struct.pack('<Q', new_buf + (size+1)*8))
+        uc.mem_write(this_ptr+16, struct.pack('<Q', new_buf + new_cap*8))
+        ret_val = 0
     else:
         # Default: allocate a buffer (helps for unknown allocator-like calls)
         ret_val = alloc(256)
@@ -203,7 +250,43 @@ t0 = time.time()
 try:
     mu.emu_start(regs['rip'], 0, count=10000000)
     print(f"Finished after {time.time()-t0:.2f}s, executed {exec_count[0]} instructions")
+    final_rip = mu.reg_read(UC_X86_REG_RIP)
+    print(f"  Final RIP: 0x{final_rip:x}")
+    # Try to find the sign output in stack/buffers. Native sign returns 32 bytes.
+    # The expected output for src=0 is e957228a... per the captured run.
+    expected_sig = bytes.fromhex('e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f')
+    # Search captured ranges for the sign output bytes
+    found = []
+    for rng_addr, rng_end, _ in [(0x400000, 0xffffffffffffff, 7)]: pass
+    # Just dump the captured stack region around where ops would write
+    rsp_orig = regs['rsp']
+    print(f"  Reading stack 0x{rsp_orig-0x100:x}-0x{rsp_orig+0x300:x}:")
+    stack_now = bytes(mu.mem_read(rsp_orig - 0x100, 0x400))
+    # Search for any 32-byte slice matching expected sig
+    if expected_sig in stack_now:
+        idx = stack_now.find(expected_sig)
+        print(f"  ✅ Found expected sign at stack offset {idx} (VA 0x{rsp_orig - 0x100 + idx:x})")
+    else:
+        # Search wider — heap region 0x22dd000-0x24b2000
+        try:
+            heap = bytes(mu.mem_read(0x22dd000, 0x1d5000))
+            if expected_sig in heap:
+                idx = heap.find(expected_sig)
+                print(f"  ✅ Found in heap at offset {idx} (VA 0x{0x22dd000 + idx:x})")
+            else:
+                print(f"  ❌ Expected sign NOT found in stack or heap")
+                # Also search shorter prefix
+                for pl in [16, 8, 4]:
+                    if expected_sig[:pl] in stack_now:
+                        idx = stack_now.find(expected_sig[:pl])
+                        print(f"     Found {pl}-byte prefix at stack offset {idx}")
+                        break
+        except Exception as e:
+            print(f"  Error searching: {e}")
 except UcError as e:
     print(f"  UcError after {time.time()-t0:.2f}s, executed {exec_count[0]}: {e}")
     rip = mu.reg_read(UC_X86_REG_RIP)
     print(f"  RIP at error: 0x{rip:x} (offset 0x{rip-WBASE:x})")
+    print(f"\nStub calls made: {len(stub_calls)}")
+    for nm, c in sorted(stub_calls.items(), key=lambda x: -x[1]):
+        print(f"  {c:>4d}x  {nm}")
