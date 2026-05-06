@@ -179,6 +179,98 @@ def stub_handle(uc, plt_va):
             uc.mem_write(this_ptr+8, struct.pack('<Q', new_buf + (size+1)*8))
             uc.mem_write(this_ptr+16, struct.pack('<Q', new_buf + new_cap*8))
         ret_val = uc.reg_read(UC_X86_REG_RAX)  # don't care
+    elif name in ('_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPKcEEvT_S8_St20forward_iterator_tag',
+                  '_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPcEEvT_S7_St20forward_iterator_tag'):
+        # std::string::_M_construct(p, q, forward_iterator_tag)
+        # rdi=this, rsi=p, rdx=q
+        this_ptr = rdi
+        p, q = rsi, rdx
+        length = q - p
+        if length <= 0 or length > 0x10000:
+            ret_val = 0
+        else:
+            chars = bytes(uc.mem_read(p, length))
+            if length <= 15:
+                # SSO: chars go inline at this+16
+                buf_va = this_ptr + 16
+                uc.mem_write(buf_va, chars + b'\x00')
+                uc.mem_write(this_ptr, struct.pack('<Q', buf_va))  # _M_dataplus._M_p
+                uc.mem_write(this_ptr+8, struct.pack('<Q', length))  # _M_string_length
+            else:
+                # Heap allocation
+                buf = alloc(length + 1)
+                uc.mem_write(buf, chars + b'\x00')
+                uc.mem_write(this_ptr, struct.pack('<Q', buf))
+                uc.mem_write(this_ptr+8, struct.pack('<Q', length))
+                uc.mem_write(this_ptr+16, struct.pack('<Q', length))  # capacity
+            ret_val = 0
+    elif name == '_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE10_M_replaceEmmPKcm':
+        # std::string::_M_replace(this, pos, n1, p, n2): replace [pos, pos+n1) with [p, p+n2)
+        # rdi=this, rsi=pos, rdx=n1, rcx=p, r8=n2
+        this_ptr = rdi
+        pos, n1, p, n2 = rsi, rdx, rcx, uc.reg_read(UC_X86_REG_R8)
+        # Read current string state
+        buf_ptr = struct.unpack('<Q', bytes(uc.mem_read(this_ptr, 8)))[0]
+        cur_len = struct.unpack('<Q', bytes(uc.mem_read(this_ptr+8, 8)))[0]
+        if buf_ptr and cur_len < 0x10000:
+            old = bytes(uc.mem_read(buf_ptr, cur_len))
+        else:
+            old = b''
+        # Compute new string
+        new_data = bytes(uc.mem_read(p, n2)) if (p and n2) else b''
+        new_str = old[:pos] + new_data + old[pos + n1:]
+        new_len = len(new_str)
+        if new_len <= 15:
+            buf_va = this_ptr + 16
+            uc.mem_write(buf_va, new_str + b'\x00')
+            uc.mem_write(this_ptr, struct.pack('<Q', buf_va))
+            uc.mem_write(this_ptr+8, struct.pack('<Q', new_len))
+        else:
+            buf = alloc(new_len + 1)
+            uc.mem_write(buf, new_str + b'\x00')
+            uc.mem_write(this_ptr, struct.pack('<Q', buf))
+            uc.mem_write(this_ptr+8, struct.pack('<Q', new_len))
+            uc.mem_write(this_ptr+16, struct.pack('<Q', new_len))
+        ret_val = this_ptr
+    elif name == '_ZNKSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE4findEPKcmm':
+        # std::string::find(p, pos, n) const: return offset or npos
+        this_ptr = rdi
+        p, pos, n = rsi, rdx, rcx
+        buf_ptr = struct.unpack('<Q', bytes(uc.mem_read(this_ptr, 8)))[0]
+        cur_len = struct.unpack('<Q', bytes(uc.mem_read(this_ptr+8, 8)))[0]
+        if buf_ptr and cur_len < 0x10000:
+            haystack = bytes(uc.mem_read(buf_ptr, cur_len))
+            needle = bytes(uc.mem_read(p, n)) if n > 0 else b''
+            idx = haystack.find(needle, pos)
+            ret_val = idx if idx >= 0 else 0xFFFFFFFFFFFFFFFF  # npos
+        else:
+            ret_val = 0xFFFFFFFFFFFFFFFF
+    elif name in ('srand', 'madvise', '__cxa_atexit', 'pthread_once'):
+        ret_val = 0
+    elif name == 'rand':
+        ret_val = 0  # deterministic with libfaketime
+    elif name == 'getpid':
+        ret_val = 1
+    elif name == '_ZNSt6chrono3_V212system_clock3nowEv':
+        ret_val = 0  # deterministic time
+    elif name == 'snprintf':
+        # snprintf(s, n, fmt, ...): write empty string
+        s = rdi; n = rsi
+        if s and n > 0:
+            uc.mem_write(s, b'\x00')
+        ret_val = 0
+    elif name == '__tls_get_addr':
+        # Return a small TLS slot
+        ret_val = alloc(64)
+    elif name == '_ZSt20__throw_system_errori':
+        # Should not return — but we have to. Just return.
+        ret_val = 0
+    elif name == 'fopen':
+        ret_val = 0  # NULL = file open failed; caller should handle
+    elif name == 'fgets':
+        ret_val = 0  # NULL = EOF/error
+    elif name == 'fclose':
+        ret_val = 0
     elif name == '_ZNSt6vectorIlSaIlEE17_M_realloc_insertIJRlEEEvN9__gnu_cxx17__normal_iteratorIPlS1_EEDpOT_':
         # std::vector<long>::_M_realloc_insert(iterator pos, long&) — same logic, simplified
         this_ptr = rdi
@@ -320,6 +412,79 @@ except UcError as e:
     print(f"  UcError after {time.time()-t0:.2f}s, executed {exec_count[0]}: {e}")
     rip = mu.reg_read(UC_X86_REG_RIP)
     print(f"  RIP at error: 0x{rip:x} (offset 0x{rip-WBASE:x})")
-    print(f"\nStub calls made: {len(stub_calls)}")
-    for nm, c in sorted(stub_calls.items(), key=lambda x: -x[1]):
-        print(f"  {c:>4d}x  {nm}")
+
+# Always do hash check (even after error)
+# Search for each X_b1/X_b2 value, plus the expected sign output
+expected_xb1 = [0x114D0B11, 0xAFFC818B, 0xFC57448F, 0x011D0687]
+expected_xb2_1 = 0x8DBF308F
+expected_sig = bytes.fromhex('e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f')
+
+def find_pattern(pat):
+    found = []
+    for rng in m['ranges']:
+        try:
+            d = bytes(mu.mem_read(rng['addr'], rng['size']))
+            pos = 0
+            while True:
+                idx = d.find(pat, pos)
+                if idx < 0: break
+                found.append(rng['addr'] + idx)
+                pos = idx + 1
+        except UcError: pass
+    return found
+
+for label, val in [('X_b1[0]=0x114D0B11', struct.pack('<I', 0x114D0B11)),
+                    ('X_b1[1]=0xAFFC818B', struct.pack('<I', 0xAFFC818B)),
+                    ('X_b1[2]=0xFC57448F', struct.pack('<I', 0xFC57448F)),
+                    ('X_b1[3]=0x011D0687', struct.pack('<I', 0x011D0687)),
+                    ('X_b2[1]=0x8DBF308F', struct.pack('<I', 0x8DBF308F))]:
+    found = find_pattern(val)
+    print(f"  {label}: found at {len(found)} positions")
+    for va in found[:3]:
+        print(f"    @ 0x{va:x}")
+
+found_sig = find_pattern(expected_sig)
+print(f"  Full sign (32B): found at {len(found_sig)} positions: {[hex(x) for x in found_sig]}")
+
+# Compare pre/post memory: which ranges did our emulation modify?
+print("\n  Memory regions modified by emulation:")
+total_changes = 0
+modified_ranges = []
+for rng in m['ranges']:
+    try:
+        d_after = bytes(mu.mem_read(rng['addr'], rng['size']))
+        d_before = open(rng['file'], 'rb').read()
+        if d_after != d_before:
+            # Count differences
+            ndiff = sum(1 for a,b in zip(d_after, d_before) if a != b)
+            modified_ranges.append((rng['addr'], rng['size'], ndiff))
+            total_changes += ndiff
+    except UcError: pass
+
+print(f"  Total bytes modified across all ranges: {total_changes}")
+print(f"  Ranges with changes:")
+for addr, sz, ndiff in sorted(modified_ranges, key=lambda x: -x[2])[:10]:
+    print(f"    0x{addr:x} ({sz} bytes): {ndiff} bytes changed")
+
+# Detailed look at heap range (0x22dd000 - 0x24b2000) byte-by-byte
+heap_range = next(r for r in m['ranges'] if r['addr'] == 0x22dd000)
+d_after = bytes(mu.mem_read(heap_range['addr'], heap_range['size']))
+d_before = open(heap_range['file'], 'rb').read()
+print(f"\n  Heap byte changes around expected sign location 0x24922b0:")
+sig_offset = 0x24922b0 - 0x22dd000
+# Show bytes [sig_offset - 16, sig_offset + 48]
+for i in range(sig_offset - 16, sig_offset + 48, 8):
+    if i < 0 or i + 8 > len(d_after): continue
+    b_b = d_before[i:i+8].hex()
+    a_b = d_after[i:i+8].hex()
+    diff = '🔄' if b_b != a_b else '   '
+    print(f"    0x{0x22dd000+i:x}: BEFORE={b_b}  AFTER={a_b} {diff}")
+
+# Also show ALL changed positions in heap
+changed_positions = [i for i in range(len(d_after)) if d_after[i] != d_before[i]]
+print(f"\n  All {len(changed_positions)} changed positions in heap:")
+for i in changed_positions[:30]:
+    print(f"    0x{0x22dd000+i:x}: {d_before[i]:02x} -> {d_after[i]:02x}")
+print(f"\nStub calls made: {len(stub_calls)}")
+for nm, c in sorted(stub_calls.items(), key=lambda x: -x[1])[:30]:
+    print(f"  {c:>4d}x  {nm}")
