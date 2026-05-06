@@ -134,6 +134,121 @@ def stub_handle(uc, plt_va):
             if uc.mem_read(rdi + sz, 1)[0] == 0: break
             sz += 1
         ret_val = sz
+    elif name in ('memcmp', 'bcmp'):
+        if rdx == 0: ret_val = 0
+        else:
+            A = bytes(uc.mem_read(rdi, rdx))
+            B = bytes(uc.mem_read(rsi, rdx))
+            ret_val = 0 if A == B else (A[0] - B[0])
+    elif name in ('strcmp',):
+        sz = 0
+        while True:
+            a = uc.mem_read(rdi+sz, 1)[0]; b = uc.mem_read(rsi+sz, 1)[0]
+            if a != b: ret_val = a - b; break
+            if a == 0: ret_val = 0; break
+            sz += 1
+    elif name in ('free', '_ZdlPv', '_ZdaPv'):
+        ret_val = 0
+    elif name in ('_ZNSt6vectorIlSaIlEE12emplace_backIJRlEEES3_DpOT_',):
+        this_ptr = rdi; val_ptr = rsi
+        val = struct.unpack('<q', bytes(uc.mem_read(val_ptr, 8)))[0]
+        begin = struct.unpack('<Q', bytes(uc.mem_read(this_ptr, 8)))[0]
+        end = struct.unpack('<Q', bytes(uc.mem_read(this_ptr+8, 8)))[0]
+        cap = struct.unpack('<Q', bytes(uc.mem_read(this_ptr+16, 8)))[0]
+        size = (end - begin) // 8 if begin else 0
+        capacity = (cap - begin) // 8 if begin else 0
+        if size < capacity:
+            uc.mem_write(end, struct.pack('<q', val))
+            uc.mem_write(this_ptr+8, struct.pack('<Q', end+8))
+        else:
+            new_cap = max(capacity * 2, 4)
+            new_buf = alloc(new_cap * 8)
+            if begin and size: uc.mem_write(new_buf, bytes(uc.mem_read(begin, size*8)))
+            uc.mem_write(new_buf + size*8, struct.pack('<q', val))
+            uc.mem_write(this_ptr, struct.pack('<Q', new_buf))
+            uc.mem_write(this_ptr+8, struct.pack('<Q', new_buf + (size+1)*8))
+            uc.mem_write(this_ptr+16, struct.pack('<Q', new_buf + new_cap*8))
+        ret_val = 0
+    elif name == '_ZNSt6vectorIlSaIlEE17_M_realloc_insertIJRlEEEvN9__gnu_cxx17__normal_iteratorIPlS1_EEDpOT_':
+        this_ptr = rdi; val_ptr = rdx
+        val = struct.unpack('<q', bytes(uc.mem_read(val_ptr, 8)))[0]
+        begin = struct.unpack('<Q', bytes(uc.mem_read(this_ptr, 8)))[0]
+        end = struct.unpack('<Q', bytes(uc.mem_read(this_ptr+8, 8)))[0]
+        size = (end - begin) // 8 if begin else 0
+        new_cap = max(size * 2, 4)
+        new_buf = alloc(new_cap * 8)
+        if begin and size: uc.mem_write(new_buf, bytes(uc.mem_read(begin, size*8)))
+        uc.mem_write(new_buf + size*8, struct.pack('<q', val))
+        uc.mem_write(this_ptr, struct.pack('<Q', new_buf))
+        uc.mem_write(this_ptr+8, struct.pack('<Q', new_buf + (size+1)*8))
+        uc.mem_write(this_ptr+16, struct.pack('<Q', new_buf + new_cap*8))
+        ret_val = 0
+    elif name in ('_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPKcEEvT_S8_St20forward_iterator_tag',
+                  '_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPcEEvT_S7_St20forward_iterator_tag'):
+        this_ptr = rdi; p, q = rsi, rdx
+        length = q - p
+        if length <= 0 or length > 0x10000:
+            ret_val = 0
+        else:
+            chars = bytes(uc.mem_read(p, length))
+            if length <= 15:
+                buf_va = this_ptr + 16
+                uc.mem_write(buf_va, chars + b'\x00')
+                uc.mem_write(this_ptr, struct.pack('<Q', buf_va))
+                uc.mem_write(this_ptr+8, struct.pack('<Q', length))
+            else:
+                buf = alloc(length + 1)
+                uc.mem_write(buf, chars + b'\x00')
+                uc.mem_write(this_ptr, struct.pack('<Q', buf))
+                uc.mem_write(this_ptr+8, struct.pack('<Q', length))
+                uc.mem_write(this_ptr+16, struct.pack('<Q', length))
+            ret_val = 0
+    elif name == '_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE10_M_replaceEmmPKcm':
+        this_ptr = rdi
+        pos, n1, p, n2 = rsi, rdx, rcx, uc.reg_read(UC_X86_REG_R8)
+        buf_ptr = struct.unpack('<Q', bytes(uc.mem_read(this_ptr, 8)))[0]
+        cur_len = struct.unpack('<Q', bytes(uc.mem_read(this_ptr+8, 8)))[0]
+        old = bytes(uc.mem_read(buf_ptr, cur_len)) if (buf_ptr and cur_len < 0x10000) else b''
+        new_data = bytes(uc.mem_read(p, n2)) if (p and n2) else b''
+        new_str = old[:pos] + new_data + old[pos + n1:]
+        new_len = len(new_str)
+        if new_len <= 15:
+            buf_va = this_ptr + 16
+            uc.mem_write(buf_va, new_str + b'\x00')
+            uc.mem_write(this_ptr, struct.pack('<Q', buf_va))
+            uc.mem_write(this_ptr+8, struct.pack('<Q', new_len))
+        else:
+            buf = alloc(new_len + 1)
+            uc.mem_write(buf, new_str + b'\x00')
+            uc.mem_write(this_ptr, struct.pack('<Q', buf))
+            uc.mem_write(this_ptr+8, struct.pack('<Q', new_len))
+            uc.mem_write(this_ptr+16, struct.pack('<Q', new_len))
+        ret_val = this_ptr
+    elif name == '_ZNKSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE4findEPKcmm':
+        this_ptr = rdi; p, pos, n = rsi, rdx, rcx
+        buf_ptr = struct.unpack('<Q', bytes(uc.mem_read(this_ptr, 8)))[0]
+        cur_len = struct.unpack('<Q', bytes(uc.mem_read(this_ptr+8, 8)))[0]
+        if buf_ptr and cur_len < 0x10000:
+            haystack = bytes(uc.mem_read(buf_ptr, cur_len))
+            needle = bytes(uc.mem_read(p, n)) if n > 0 else b''
+            idx = haystack.find(needle, pos)
+            ret_val = idx if idx >= 0 else 0xFFFFFFFFFFFFFFFF
+        else:
+            ret_val = 0xFFFFFFFFFFFFFFFF
+    elif name in ('srand', 'madvise', '__cxa_atexit', 'pthread_once',
+                  'pthread_mutex_lock', 'pthread_mutex_unlock', 'time',
+                  'pthread_self', '__cxa_finalize', '__errno_location',
+                  'getpid', 'rand', 'clock_gettime',
+                  '_ZNSt6chrono3_V212system_clock3nowEv',
+                  '_ZSt20__throw_system_errori',
+                  'fopen', 'fgets', 'fclose'):
+        ret_val = 0
+    elif name == '__tls_get_addr':
+        ret_val = alloc(256)
+    elif name == 'snprintf':
+        s = rdi; n = rsi
+        if s and n > 0: uc.mem_write(s, b'\x00')
+        ret_val = 0
     elif name == '__stack_chk_fail':
         # Should never happen — just return
         ret_val = 0
