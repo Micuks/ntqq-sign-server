@@ -1,0 +1,209 @@
+"""Unicorn replay v2: use full memory dump from same Frida run."""
+import struct, json, os
+from unicorn import *
+from unicorn.x86_const import *
+import capstone
+
+m = json.load(open('/tmp/op60_memdump.json'))
+WBASE = m['wrapper_base']
+regs = m['regs']
+print(f"Wrapper base in capture: 0x{WBASE:x}")
+print(f"RIP at op 0x60 entry: 0x{regs['rip']:x} (offset 0x{regs['rip']-WBASE:x})")
+
+mu = Uc(UC_ARCH_X86, UC_MODE_64)
+
+PAGE = 0x1000
+def align_down(x): return x & ~(PAGE-1)
+def align_up(x): return (x + PAGE - 1) & ~(PAGE-1)
+
+# First map wrapper.node segments from file (gives proper exec perms)
+WFILE = '/mnt/data1/wuql/services/ntqq-sign-server/wrapper.node'
+wdata = open(WFILE, 'rb').read()
+e_phoff, = struct.unpack_from('<Q', wdata, 0x20)
+e_phentsize, = struct.unpack_from('<H', wdata, 0x36)
+e_phnum, = struct.unpack_from('<H', wdata, 0x38)
+
+wrapper_va_ranges = []
+for i in range(e_phnum):
+    p = wdata[e_phoff + i*e_phentsize: e_phoff + (i+1)*e_phentsize]
+    p_type, p_flags, p_offset, _, p_vaddr, p_filesz, p_memsz, _ = struct.unpack('<IIQQQQQQ', p)
+    if p_type != 1: continue
+    perms = (UC_PROT_READ if p_flags & 4 else 0) | (UC_PROT_WRITE if p_flags & 2 else 0) | (UC_PROT_EXEC if p_flags & 1 else 0)
+    va_start = align_down(WBASE + p_vaddr)
+    va_end = align_up(WBASE + p_vaddr + p_memsz)
+    mu.mem_map(va_start, va_end - va_start, perms)
+    mu.mem_write(WBASE + p_vaddr, wdata[p_offset:p_offset + p_filesz])
+    wrapper_va_ranges.append((va_start, va_end))
+    print(f"  Mapped wrapper.node seg {i}: 0x{va_start:x}-0x{va_end:x} perms={perms}")
+
+def overlaps_wrapper(a, b):
+    for ws, we in wrapper_va_ranges:
+        if a < we and b > ws:
+            return True
+    return False
+
+# Then map captured ranges outside wrapper.node
+prot_to_uc = {'r--': UC_PROT_READ, 'r-x': UC_PROT_READ | UC_PROT_EXEC,
+              'rw-': UC_PROT_READ | UC_PROT_WRITE, 'rwx': UC_PROT_ALL}
+
+ok = 0; fail = 0; skip = 0
+for r in sorted(m['ranges'], key=lambda x: x['addr']):
+    addr = r['addr']; size = r['size']
+    page_start = align_down(addr); page_end = align_up(addr + size)
+    if page_end - page_start == 0: continue
+    if overlaps_wrapper(page_start, page_end):
+        # Inside wrapper.node — write data on top (RW segments may have been modified)
+        try:
+            with open(r['file'], 'rb') as f: data = f.read()
+            mu.mem_write(addr, data)
+        except UcError:
+            pass
+        skip += 1
+        continue
+    perms = prot_to_uc.get(r['prot'], UC_PROT_READ | UC_PROT_WRITE)
+    try:
+        mu.mem_map(page_start, page_end - page_start, perms)
+        with open(r['file'], 'rb') as f: data = f.read()
+        mu.mem_write(addr, data)
+        ok += 1
+    except UcError as e:
+        fail += 1
+
+print(f"\nMapped {ok} captured ranges, {skip} overlap wrapper, {fail} failed")
+
+# FS region for canary - allocate enough room for negative offsets too
+FS_VA = 0x70000000
+mu.mem_map(FS_VA - 0x10000, 0x20000, UC_PROT_READ | UC_PROT_WRITE)
+mu.mem_write(FS_VA + 0x28, struct.pack('<Q', 0xCAFEBABEDEADBEEF))
+mu.reg_write(UC_X86_REG_FS_BASE, FS_VA)
+
+# Restore registers
+for k, ucr in [('rax', UC_X86_REG_RAX), ('rbx', UC_X86_REG_RBX),
+               ('rcx', UC_X86_REG_RCX), ('rdx', UC_X86_REG_RDX),
+               ('rsi', UC_X86_REG_RSI), ('rdi', UC_X86_REG_RDI),
+               ('rbp', UC_X86_REG_RBP), ('rsp', UC_X86_REG_RSP),
+               ('r8', UC_X86_REG_R8),  ('r9', UC_X86_REG_R9),
+               ('r10', UC_X86_REG_R10),('r11', UC_X86_REG_R11),
+               ('r12', UC_X86_REG_R12),('r13', UC_X86_REG_R13),
+               ('r14', UC_X86_REG_R14),('r15', UC_X86_REG_R15),
+               ('rflags', UC_X86_REG_EFLAGS)]:
+    mu.reg_write(ucr, regs[k])
+
+# Heap allocator for stubs
+HEAP_VA = 0xb0000000
+mu.mem_map(HEAP_VA, 0x1000000, UC_PROT_READ | UC_PROT_WRITE)
+heap_top = [HEAP_VA]
+def alloc(n):
+    n = (n + 0xf) & ~0xf
+    p = heap_top[0]; heap_top[0] += max(n, 16)
+    return p
+
+# Subprocess to load PLT names
+import subprocess
+plt_out = subprocess.check_output(['objdump', '-d', '--section=.plt', '/mnt/data1/wuql/services/ntqq-sign-server/wrapper.node'], text=True)
+plt_addr_to_name = {}
+for line in plt_out.split('\n'):
+    if '@plt>:' in line:
+        parts = line.split()
+        plt_addr_to_name[int(parts[0], 16)] = parts[1].rstrip(':').strip('<>').replace('@plt', '')
+
+WRAPPER_END = WBASE + 0x7dc0818
+WRAPPER_START = WBASE
+PLT_LO_VA = WBASE + 0x7ae5ba0  # exclude header at 0x7ae5b90
+PLT_HI_VA = WBASE + 0x7ae5b90 + 793*16
+
+# Hooks
+md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+exec_count = [0]
+stub_calls = {}
+
+def stub_handle(uc, plt_va):
+    plt_off = plt_va - WBASE
+    plt_addr_no_base = plt_off  # in objdump file
+    # Round to PLT entry (16-byte aligned, starting at 0x7ae5ba0)
+    plt_idx = (plt_addr_no_base - 0x7ae5ba0) // 16
+    plt_entry = 0x7ae5ba0 + plt_idx * 16
+    name = plt_addr_to_name.get(plt_entry, f'plt+0x{plt_off:x}')
+    stub_calls[name] = stub_calls.get(name, 0) + 1
+    rdi = uc.reg_read(UC_X86_REG_RDI); rsi = uc.reg_read(UC_X86_REG_RSI)
+    rdx = uc.reg_read(UC_X86_REG_RDX); rcx = uc.reg_read(UC_X86_REG_RCX)
+    # Emulate the call
+    ret_val = 0
+    if name in ('malloc','_Znwm','_Znam','_ZnwmRKSt9nothrow_t'):
+        ret_val = alloc(rdi)
+    elif name == 'memset':
+        if rdx > 0: uc.mem_write(rdi, bytes([rsi & 0xff]) * rdx)
+        ret_val = rdi
+    elif name in ('memcpy','memmove'):
+        if rdx > 0: uc.mem_write(rdi, bytes(uc.mem_read(rsi, rdx)))
+        ret_val = rdi
+    elif name in ('memcmp','bcmp'):
+        if rdx == 0: ret_val = 0
+        else:
+            A = bytes(uc.mem_read(rdi, rdx))
+            B = bytes(uc.mem_read(rsi, rdx))
+            ret_val = 0 if A == B else (A[0] - B[0])
+    elif name == 'strlen':
+        sz = 0
+        while sz < 0x10000:
+            if uc.mem_read(rdi + sz, 1)[0] == 0: break
+            sz += 1
+        ret_val = sz
+    else:
+        # Default: allocate a buffer (helps for unknown allocator-like calls)
+        ret_val = alloc(256)
+    uc.reg_write(UC_X86_REG_RAX, ret_val)
+    # Pop return addr from stack and jump
+    rsp = uc.reg_read(UC_X86_REG_RSP)
+    rip_b = uc.mem_read(rsp, 8)
+    ret_addr = struct.unpack('<Q', bytes(rip_b))[0]
+    uc.reg_write(UC_X86_REG_RSP, rsp + 8)
+    uc.reg_write(UC_X86_REG_RIP, ret_addr)
+
+def hook_code(uc, address, size, user_data):
+    exec_count[0] += 1
+    # Detect PLT entry execution
+    if PLT_LO_VA <= address < PLT_HI_VA:
+        stub_handle(uc, address)
+        return
+    # Detect execution leaving wrapper.node
+    if not (WRAPPER_START <= address < WRAPPER_END):
+        # Outside wrapper.node — must be a PLT-stubbed function jumped to actual lib code
+        # Find caller (return address on top of stack)
+        # We can't know which symbol; treat as unknown stub returning 0
+        rsp = uc.reg_read(UC_X86_REG_RSP)
+        rip_b = uc.mem_read(rsp, 8)
+        ret_addr = struct.unpack('<Q', bytes(rip_b))[0]
+        stub_calls[f'extern@0x{address-WBASE:x}'] = stub_calls.get(f'extern@0x{address-WBASE:x}', 0) + 1
+        # Return 0 (or pointer to small heap buffer)
+        uc.reg_write(UC_X86_REG_RAX, alloc(64))
+        uc.reg_write(UC_X86_REG_RSP, rsp + 8)
+        uc.reg_write(UC_X86_REG_RIP, ret_addr)
+        return
+    if exec_count[0] in (1, 100, 1000, 10000, 100000, 500000, 1000000, 5000000):
+        try:
+            b = uc.mem_read(address, size)
+            ins = next(md.disasm(bytes(b), address), None)
+            print(f"  [{exec_count[0]:>7d}] 0x{address:08x}: {ins.mnemonic if ins else '???'} {ins.op_str if ins else ''}")
+        except: pass
+mu.hook_add(UC_HOOK_CODE, hook_code)
+
+invalid_log = []
+def hook_invalid(uc, access, address, size, value, user_data):
+    rip = uc.reg_read(UC_X86_REG_RIP)
+    invalid_log.append((rip, access, address, size))
+    if len(invalid_log) <= 5:
+        print(f"  INVALID @ 0x{rip:x} (offset 0x{rip-WBASE:x}): access={access} addr=0x{address:x} sz={size}")
+    return False
+mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED, hook_invalid)
+
+import time
+print(f"\nStarting at RIP=0x{regs['rip']:x}")
+t0 = time.time()
+try:
+    mu.emu_start(regs['rip'], 0, count=10000000)
+    print(f"Finished after {time.time()-t0:.2f}s, executed {exec_count[0]} instructions")
+except UcError as e:
+    print(f"  UcError after {time.time()-t0:.2f}s, executed {exec_count[0]}: {e}")
+    rip = mu.reg_read(UC_X86_REG_RIP)
+    print(f"  RIP at error: 0x{rip:x} (offset 0x{rip-WBASE:x})")
