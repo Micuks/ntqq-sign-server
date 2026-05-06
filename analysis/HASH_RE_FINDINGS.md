@@ -88,3 +88,16 @@ Frida at sign time. Subsequent calls run entirely in pure Python via
 
 A FULL pure-Python solution (no native call ever) is an open RE challenge
 beyond the scope of this session.
+
+## Linearity / pattern analysis (additional findings 2026-05-06)
+
+Captured 64 (src_byte → X_b1_init[1..3], X_b2[1]) pairs and tested:
+- Linearity over GF(2): only 7/64 predictions match → hash is NON-LINEAR.
+- Single-XOR-constant pattern: 64 unique XOR values across 64 srcs → no
+  affine constant offset works.
+- Substring search in MD5/SHA1/SHA256/SHA512 of `cmd+src`, `src+cmd`,
+  `cmd+\x00*N+src`, etc.: NO matches.
+
+The hash is a non-linear cryptographic transformation that does not match
+any standard algorithm with a simple input format. The full RE requires
+deobfuscating the inner CFF state machine in op 0x60's chain.
