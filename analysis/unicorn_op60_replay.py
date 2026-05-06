@@ -4,7 +4,9 @@ from unicorn import *
 from unicorn.x86_const import *
 import capstone
 
-m = json.load(open('/tmp/op60_memdump.json'))
+import os as _os
+DUMP_PATH = _os.environ.get('DUMP_PATH', '/tmp/op60_memdump.json')
+m = json.load(open(DUMP_PATH))
 WBASE = m['wrapper_base']
 regs = m['regs']
 print(f"Wrapper base in capture: 0x{WBASE:x}")
@@ -94,7 +96,8 @@ for k, ucr in [('rax', UC_X86_REG_RAX), ('rbx', UC_X86_REG_RBX),
 
 # Heap allocator for stubs
 HEAP_VA = 0xb0000000
-mu.mem_map(HEAP_VA, 0x1000000, UC_PROT_READ | UC_PROT_WRITE)
+HEAP_SIZE = 0x10000000  # 256 MB to be safe
+mu.mem_map(HEAP_VA, HEAP_SIZE, UC_PROT_READ | UC_PROT_WRITE)
 heap_top = [HEAP_VA]
 def alloc(n):
     n = (n + 0xf) & ~0xf
@@ -344,6 +347,17 @@ def hook_invalid(uc, access, address, size, value, user_data):
 mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED, hook_invalid)
 
 import time
+# DEFINITIVE TEST: zero out the suspected output buffer location BEFORE running.
+# If emulation works, it should write the correct sign there.
+SIG_LOCATIONS = {
+    '/tmp/op60_memdump.json':    0x24922b0,
+    '/tmp/op60_memdump_42.json': 0x2137640,
+}
+clear_addr = SIG_LOCATIONS.get(DUMP_PATH)
+if clear_addr:
+    mu.mem_write(clear_addr, b'\xCC' * 32)  # Marker bytes
+    print(f"Zeroed (filled with 0xCC) buffer at 0x{clear_addr:x} before emulation")
+
 print(f"\nStarting at RIP=0x{regs['rip']:x}")
 t0 = time.time()
 try:
@@ -384,7 +398,11 @@ try:
     # Compare entire memory before/after emulation. Bytes that DIFFER are what
     # our emulation wrote. If hash output is among them, it appears as new bytes
     # in heap/stack regions.
-    expected_sig = bytes.fromhex('e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f')
+    _sig_map = {
+        '/tmp/op60_memdump.json':    'e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f',
+        '/tmp/op60_memdump_42.json': '9fb5974211ac4e148579b26575ecc8c34f3dfd82728cecaf00ab0bfb394186e3',
+    }
+    expected_sig = bytes.fromhex(_sig_map.get(DUMP_PATH, 'e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f'))
     sig_locations_after = []
     sig_locations_before = []
     for rng in m['ranges']:
@@ -417,7 +435,11 @@ except UcError as e:
 # Search for each X_b1/X_b2 value, plus the expected sign output
 expected_xb1 = [0x114D0B11, 0xAFFC818B, 0xFC57448F, 0x011D0687]
 expected_xb2_1 = 0x8DBF308F
-expected_sig = bytes.fromhex('e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f')
+_sig_map = {
+    '/tmp/op60_memdump.json':    'e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f',
+    '/tmp/op60_memdump_42.json': '9fb5974211ac4e148579b26575ecc8c34f3dfd82728cecaf00ab0bfb394186e3',
+}
+expected_sig = bytes.fromhex(_sig_map.get(DUMP_PATH, 'e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f'))
 
 def find_pattern(pat):
     found = []
@@ -445,6 +467,41 @@ for label, val in [('X_b1[0]=0x114D0B11', struct.pack('<I', 0x114D0B11)),
 
 found_sig = find_pattern(expected_sig)
 print(f"  Full sign (32B): found at {len(found_sig)} positions: {[hex(x) for x in found_sig]}")
+
+# Also search OUR heap region (where stubs allocate)
+try:
+    our_heap = bytes(mu.mem_read(HEAP_VA, heap_top[0] - HEAP_VA))
+    pos = our_heap.find(expected_sig)
+    if pos >= 0:
+        print(f"  ✅ Expected sign found in our_heap at offset 0x{pos:x} (VA 0x{HEAP_VA + pos:x})!")
+    else:
+        # Try shorter prefixes
+        for plen in [16, 8, 4]:
+            p = our_heap.find(expected_sig[:plen])
+            if p >= 0:
+                print(f"  Found {plen}-byte prefix in our_heap at offset 0x{p:x}")
+                break
+except UcError: pass
+
+# Check final register state
+print("\n  Final register state:")
+for k, ucr in [('rax', UC_X86_REG_RAX), ('rbx', UC_X86_REG_RBX),
+               ('rcx', UC_X86_REG_RCX), ('rdx', UC_X86_REG_RDX),
+               ('rsi', UC_X86_REG_RSI), ('rdi', UC_X86_REG_RDI),
+               ('rbp', UC_X86_REG_RBP), ('rsp', UC_X86_REG_RSP),
+               ('r8', UC_X86_REG_R8),  ('r9', UC_X86_REG_R9),
+               ('r12', UC_X86_REG_R12),('r13', UC_X86_REG_R13),
+               ('r14', UC_X86_REG_R14),('r15', UC_X86_REG_R15)]:
+    v = mu.reg_read(ucr)
+    note = ''
+    if v == 0x114D0B11: note = ' ← X_b1[0]!'
+    elif v == 0xAFFC818B: note = ' ← X_b1[1]!'
+    elif v == 0xFC57448F: note = ' ← X_b1[2]!'
+    elif v == 0x11D0687: note = ' ← X_b1[3]!'
+    elif v == 0x8DBF308F: note = ' ← X_b2[1]!'
+    elif (v & 0xffffffff) == 0x114D0B11: note = ' ← X_b1[0] (low 32)!'
+    elif (v & 0xffffffff) == 0xFC57448F: note = ' ← X_b1[2] (low 32)!'
+    print(f"    {k:>5s} = 0x{v:016x}{note}")
 
 # Compare pre/post memory: which ranges did our emulation modify?
 print("\n  Memory regions modified by emulation:")

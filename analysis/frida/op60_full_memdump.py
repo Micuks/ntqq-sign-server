@@ -100,7 +100,8 @@ SIGN_T = ctypes.CFUNCTYPE(ctypes.c_longlong, ctypes.c_char_p,
     ctypes.POINTER(ctypes.c_ubyte))
 sf = SIGN_T(base.value + 0x56D81D1)
 COUNTER = base.value + 0x7DD868C
-sb = (ctypes.c_ubyte * 1)(0)
+SRC_BYTE = int(os.environ.get('SRC_BYTE', '0x00'), 16)
+sb = (ctypes.c_ubyte * 1)(SRC_BYTE)
 out = (ctypes.c_ubyte * 0x300)()
 ctypes.c_uint32.from_address(COUNTER).value = 100
 sf(b'wtlogin.login', sb, 1, 1, out)
@@ -136,7 +137,8 @@ def main():
     script = session.create_script(src)
 
     state = {'regs': None, 'ranges': [], 'done': False}
-    range_data_dir = '/tmp/op60_memdump'
+    suffix = os.environ.get('DUMP_SUFFIX', '')
+    range_data_dir = f'/tmp/op60_memdump{suffix}'
     os.makedirs(range_data_dir, exist_ok=True)
     range_data = {}  # idx -> bytes
 
@@ -186,13 +188,14 @@ def main():
         addr = int(r['addr'], 16)
         idx = r['idx']
         if idx in range_data:
-            fname = f'/tmp/op60_memdump/range_{idx:04d}.bin'
+            fname = f'/tmp/op60_memdump{suffix}/range_{idx:04d}.bin'
             with open(fname, 'wb') as f:
                 f.write(range_data[idx])
             out_meta['ranges'].append({'addr': addr, 'size': r['size'], 'prot': r['prot'], 'file': fname})
-    with open('/tmp/op60_memdump.json', 'w') as f:
+    json_path = f'/tmp/op60_memdump{suffix}.json'
+    with open(json_path, 'w') as f:
         json.dump(out_meta, f, indent=2)
-    print(f'[main] Saved /tmp/op60_memdump.json with {len(out_meta["ranges"])} ranges')
+    print(f'[main] Saved {json_path} with {len(out_meta["ranges"])} ranges')
 
     p.stdin.write('EXIT\n'); p.stdin.flush()
     p.terminate()
