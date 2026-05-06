@@ -1,90 +1,103 @@
-# Unicorn-Emulation Path Status
+# Unicorn-Emulation Path: Final Status Snapshot
 
 ## Goal
-Fully eliminate the native `wrapper.node` call from `no_frida_sign`. Replace it
-with pure-Python emulation via Unicorn engine.
+Fully eliminate the residual native `wrapper.node` call from `no_frida_sign`,
+achieving 100% pure-Python (or Unicorn-emulated) sign computation.
 
-## Architecture
-1. Capture full process memory + register state at op 0x60 entry via Frida
-   (offline RE step, baked into runtime data).
-2. At runtime, load Unicorn, restore captured state, run from op 0x60 entry.
-3. Stub all PLT calls (libc + libstdc++).
-4. Read hash output from final memory state.
+## Discoveries This Session
 
-## Current Progress (commit b64a316)
+### Critical Insights
+1. **Control flow is data-independent at instruction level.** Two different
+   srcs (0x43 and 0x44) produce IDENTICAL 5,391,947-instruction execution
+   traces in wrapper.node code (within 0x5cc0000-0x5cf0000 range). The
+   apparent divergence between 0x42 and 0x43 was purely Frida JIT warmup
+   overhead.
+2. **X_b1_init values are an analytical-inverse construct.** Frida-scanned
+   1.95M block executions during sign(): 0x114D0B11 (X_b1_init[0] for
+   wtlogin.login) appears in NO register at any point. Same for the 16K-step
+   VM register trace — zero hits for any of {0x114D0B11, 0xAFFC818B,
+   0xFC57448F, 0x011D0687, 0x8DBF308F}. Wrapper.node's cipher uses a
+   different internal representation that's mathematically equivalent.
+3. **Op 0x60 fires only ONCE per sign() call** at VM step 1784516. The block
+   at 0x5ce6006 is hit 2x (likely entry + state-machine re-entry).
 
-### Working
-- ELF parsing & wrapper.node mapping at correct VAs (segments 1–4).
-- Captured 484 readable memory ranges (140 MB) at op 0x60 entry.
-- Captured full register state including stack canary value.
-- Unicorn-side FS_BASE setup with correct canary.
-- Heap allocator + stub framework for PLT externs.
-- Implemented stubs: malloc, _Znwm, _Znam, free, _ZdlPv, _ZdaPv, memset,
-  memcpy, memmove, memcmp, bcmp, strlen.
-- Full `std::vector<long>::emplace_back` semantics (size/capacity bookkeeping).
-- Full `std::vector<long>::_M_realloc_insert` semantics.
-- Stack canary check passes correctly.
+### Infrastructure Built
+- **`analysis/frida/op60_full_memdump.py`**: dumps all 484 readable process
+  memory ranges (~140MB) plus full register state at op 0x60 entry, in a
+  single sign() call. Configurable via SRC_BYTE / DUMP_SUFFIX env.
+- **`analysis/unicorn_op60_replay.py`**: maps wrapper.node ELF + captured
+  ranges into Unicorn at correct VAs. Sets up FS_BASE for stack canary.
+  Runs from captured RIP. PLT detection + stub framework.
+- **`analysis/unicorn_sign_full_proto.py`**: variant that runs from sign_fn
+  entry (0x56D81D1) with input/output buffer setup.
 
-### Status
-- Emulation runs **120,454 instructions** cleanly from op 0x60 entry.
-- Then fails at fetch from RIP=0 (a stub returned 0, used as function ptr).
-- 27 distinct PLT externals invoked; 12 properly stubbed, 15 are generic
-  alloc-and-return (likely incorrect for callers that need real semantics).
+### Stubs Implemented (in analysis/unicorn_op60_replay.py)
+- malloc / `_Znwm` / `_Znam` / `_ZnwmRKSt9nothrow_t` (heap allocator)
+- free / `_ZdlPv` / `_ZdaPv`
+- memset / memcpy / memmove / memcmp / bcmp / strlen
+- `std::vector<long>::emplace_back` (full SSO + capacity tracking)
+- `std::vector<long>::_M_realloc_insert`
+- `std::string::_M_construct(PKc/Pc)` (full SSO layout)
+- `std::string::_M_replace`
+- `std::string::find`
+- srand / madvise / pthread_once / pthread_mutex_lock/unlock / time
+- snprintf (writes empty string)
+- `__tls_get_addr` (returns small alloc)
+- getpid / __cxa_atexit (return 0)
+- system_clock::now / chrono::system_clock::now (return 0, deterministic)
+- fopen / fgets / fclose (return 0/NULL)
+- `_ZSt20__throw_system_errori` (returns 0, exception swallowed)
 
-### Stubs Still Needed for Correctness
-| Function | Calls | Notes |
-|----------|-------|-------|
-| `string::_M_construct(PKc)` | 4 | Need full std::string semantics |
-| `string::_M_replace` | 2 | Modify string contents |
-| `string::find` | 2 | Search and return offset |
-| `string::_M_construct(Pc)` | 1 | Variant for char* |
-| `__tls_get_addr` | 2 | TLS access (return TLS slot) |
-| `system_clock::now` | 1 | Time-dependent (return constant) |
-| `snprintf` | 1 | Formatted output |
-| `srand` / `rand` | 1+2 | RNG (deterministic with libfaketime) |
-| `madvise` | 1 | Memory advisor (no-op) |
-| `getpid` | 1 | Return constant |
-| `fopen/fgets/fclose` | 1+1+1 | File I/O for /proc/self stuff |
-| `pthread_once` | 1 | Run once-init, then no-op |
-| `_ZSt20__throw_system_errori` | 1 | C++ exception (avoid) |
-| `_ZNSt6chrono...now` | 1 | Time-dependent |
+## Validation Status
 
-## Path Forward (Per User: Use libstdc++ via ctypes)
+### What Was Tested
+- Unicorn from 0x5ce6006 (helper entry inside op 0x60 region):
+  - 5,380,152 instructions execute (matches captured exec trace size)
+  - Halts on "Unhandled CPU exception" near offset 0x56e5b98
+  - **Hash output NOT produced**: clearing 0x24922b0 with 0xCC and re-running
+    leaves the buffer at 0xCC. Expected sign not found anywhere in memory.
+- Unicorn from sign_fn entry (0x56D81D1):
+  - Only 201 instructions execute before failing on null-pointer read
+  - Generic stubs return alloc'd buffers but C++ stdlib calls need real impl
 
-### Approach
-For complex C++ ABI stubs, instead of reimplementing in Python:
-1. `ctypes.CDLL('libstdc++.so.6')` to load real libstdc++.
-2. For each std::string function, dlsym the mangled name.
-3. When PLT stub fires, marshal args from Unicorn → host buffer, call libstdc++,
-   marshal result back to Unicorn.
+### Why Validation Fails
+- Generic stubs return `alloc(256)` for unhandled calls; the buffer is
+  uninitialized so callers reading from it get garbage.
+- The function at 0x5ce6006 may not be op 0x60's hash entry; it's a helper
+  called from 0x5ccda32 in the dispatcher CFF chain.
+- Unicorn's `Unhandled CPU exception` near sign() epilogue suggests a
+  `syscall` / `cpuid` / unsupported AVX instruction Unicorn can't decode.
 
-### Memory Marshaling Options
-- **Option A (per-call copy)**: Read input bytes from Unicorn via `mem_read`,
-  pass to native, write output back via `mem_write`. Slow but simple.
-- **Option B (mem_map_ptr)**: Use Unicorn 2's `mem_map_ptr(va, sz, perms, host_buf)`
-  to map a Python-allocated buffer at a specific VA in Unicorn. Both sides see
-  the same memory. Requires careful VA selection to avoid Python's own mappings.
+## Remaining Work (Multi-Week Estimate)
 
-Option B is faster but more complex. Recommend Option A for initial impl.
+### Approach A: Make sign_fn-entry emulation work end-to-end
+1. Port full string/vector stubs from op60_replay to sign_full_proto: 1d
+2. Implement libstdc++ forwarding via ctypes (per user suggestion): 2d
+   - mmap host buffer at high VAs to share memory between Unicorn and
+     native libstdc++ calls
+   - For each PLT call, marshal args, call native, marshal return
+3. Handle `std::thread` / `std::future` setup (one std::thread call in
+   sign() setup; emulate worker thread synchronously inline): 1-2d
+4. Handle CPU-exception-causing instructions (xsavec, vector ops): 1d
+5. Validation against captured (cmd, src) → sign tuples: 2-3d
 
-### Validation Strategy
-- Capture op 0x60 OUTPUT state in addition to input state.
-- After Unicorn replay, compare register/memory state against captured output.
-- If matches: hash function correctly emulated.
-- For src variation: capture states for src=0x00 and src=0x42 separately,
-  modify src buffer in Unicorn, verify both produce correct outputs.
-
-## Estimated Remaining Effort
-- Implement libstdc++ forwarders for 15 functions: 1 day
-- Capture output state for validation: 1 day
-- Debug correctness mismatches: 2–4 days (CFF state machine subtleties)
-- Integration into pure_native_free_sign: 1 day
-- End-to-end validation across cmds/srcs: 1 day
-
-**Total: ~1 week of focused work**
+### Approach B: Identify TRUE op 0x60 entry and capture there
+1. Use Frida MemoryAccessMonitor or breakpoint on the sign output buffer
+   first-write to find precise op 0x60 exit point.
+2. Walk back from exit through the dispatcher CFF chain to find entry.
+3. Re-capture state at the precise op 0x60 entry.
+4. Run Unicorn from there (smaller instruction count, fewer stubs).
 
 ## Practical Fallback
-The shipped `no_frida_sign.NoFridaSignProvider` already meets the "no Frida"
-goal: ONE ctypes call per (cmd, src), then forever pure Python via pure_cipher.
-For typical NTQQ usage with cached (cmd, src), the residual native call is
-amortized to near-zero over a session.
+The shipped `no_frida_sign.NoFridaSignProvider` already meets the practical
+"no Frida" goal: ONE ctypes call per (cmd, src) bootstrap, then forever pure
+Python via pure_cipher. For typical NTQQ usage with cached (cmd, src), the
+residual native call is amortized to near-zero over a session.
+
+## Total Session Commits (this work)
+- a37bfbe — Document Unicorn path status
+- b64a316 — Unicorn op60 replay 5.38M instructions
+- 3b6bf0c — Unicorn diagnostics: hash output not produced
+- f0faa8a — Unicorn sign_fn-entry prototype
+- decf0db — Definitive test: cleared buffer remains 0xCC
+- (this commit) — Final session status snapshot
