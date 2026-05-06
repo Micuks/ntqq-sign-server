@@ -101,3 +101,76 @@ Captured 64 (src_byte → X_b1_init[1..3], X_b2[1]) pairs and tested:
 The hash is a non-linear cryptographic transformation that does not match
 any standard algorithm with a simple input format. The full RE requires
 deobfuscating the inner CFF state machine in op 0x60's chain.
+
+## Refined output structure (2026-05-06, 254-src dataset)
+
+Re-examined captured `(src, X_b1_init, X_b2_init)` data with 254 clean entries
+(from `/tmp/xb1_data.json`). Updated invariants:
+
+- `X_b1_init[0]` = `0x114D0B11` (32-bit constant)
+- `X_b1_init[1]` lower 16 bits = `0x818B` (constant)
+- `X_b1_init[3]` bits 8–31 = `0x011D06` (24-bit constant) — only the **lower 8 bits**
+  vary, not 16 as previously stated.
+
+Variable bits per `(cmd, src)`:
+- `X_b1_init[1]` upper 16 (16 bits)
+- `X_b1_init[2]` full (32 bits)
+- `X_b1_init[3]` lower 8 (8 bits)
+- `X_b2_init[1]` (32 bits)
+
+Total = **88 varying bits + 32** = 120 hash output bits.
+
+## Avalanche analysis (2026-05-06)
+
+Single-bit flip pairs across 254 srcs (1008 pairs) — output bit-difference
+distribution over the 88 varying-bit hash:
+
+- Mean diff = 44.1 / 88 ≈ **50.1%** ✓ matches cryptographic-hash expectation.
+- Per-input-bit avalanche: bits 0–7 each flip ~44/88 output bits on average.
+- Per-output-bit linearity over GF(2): all 88 variable bits are NON-linear
+  in src bits (no single output bit fits an affine `XOR(subset of input bits) + c`
+  function).
+
+Conclusion: the hash has full cryptographic avalanche properties — **not** a
+weak/permutation-style mixer.
+
+## Extended hash family search (2026-05-06)
+
+Tested every 32-bit slice of:
+- MD5, SHA1, SHA256, SHA512, SHA3-256, BLAKE2b/s, xxh64, xxh128, mmh3-64/128
+- HMAC-MD5 / HMAC-SHA256 with keys: `cmd`, `0x114D0B11`, `0x818B011D`, `b"qq"`, `b"NTQQ"`
+
+Across input encodings:
+- `cmd+src`, `src+cmd`, `src` alone, `cmd` alone, `cmd+\\0+src`,
+  `cmd+seq+src`, `len(cmd)+cmd+src`, `magic+cmd+src` (5 magic prefixes)
+
+Total 324,096 candidate slices tested against `X_b1_init[2]` (32-bit unique
+field) over 64 srcs. **Zero matches.**
+
+## Self-cipher hypothesis (2026-05-06)
+
+Tested whether `cipher_forward(init, RK_B1)` from `pure_cipher` could produce
+the hash output, with `init` derived as:
+- `padded(cmd+src)` (multiple paddings)
+- `padded(src+cmd)`
+- `[0x114D0B11, src<<24|0x818B, 0, 0]` (using known constants as IV)
+
+**Zero matches** — the cipher used for sign output is NOT the function used
+to derive `X_b1_init` / `X_b2[1]`.
+
+## Final assessment
+
+The hash is a **custom cryptographic primitive** with full avalanche,
+non-linear over GF(2), and not matching any standard hash family or the
+internal SM4-like cipher. It is implemented inline within op 0x60's CFF
+dispatcher block at VA 0x5cd... in wrapper.node.
+
+**Path to fully eliminate the residual native call**: deobfuscate op 0x60's
+inner CFF state machine and reimplement the mixing function in pure Python.
+Estimated effort: 1–3 weeks of focused static analysis.
+
+**Practical alternative shipped**: `no_frida_sign.NoFridaSignProvider` — one
+ctypes call per `(cmd, src)` for bootstrap, then forever pure-Python via
+`pure_cipher`. For typical NTQQ usage with a small set of cmds and
+cached `src` per session, this is functionally equivalent to "no native call"
+after the first warmup.
