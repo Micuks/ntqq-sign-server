@@ -139,7 +139,7 @@ def main():
     def align_down(x): return x & ~(PAGE-1)
     def align_up(x): return (x + PAGE - 1) & ~(PAGE-1)
 
-    # Map wrapper.node
+    WBASE = 0  # wrapper.node at base 0, but we'll patch the ELF magic afterwards
     wdata = open(WRAPPER, 'rb').read()
     e_phoff, = struct.unpack_from('<Q', wdata, 0x20)
     e_phentsize, = struct.unpack_from('<H', wdata, 0x36)
@@ -150,15 +150,14 @@ def main():
         p_type, p_flags, p_offset, _, p_vaddr, p_filesz, p_memsz, _ = struct.unpack('<IIQQQQQQ', p)
         if p_type != 1: continue
         perms = (UC_PROT_READ if p_flags & 4 else 0) | (UC_PROT_WRITE if p_flags & 2 else 0) | (UC_PROT_EXEC if p_flags & 1 else 0)
-        va_start = align_down(p_vaddr); va_end = align_up(p_vaddr + p_memsz)
+        va_start = align_down(WBASE + p_vaddr); va_end = align_up(WBASE + p_vaddr + p_memsz)
         mu.mem_map(va_start, va_end - va_start, perms)
-        mu.mem_write(p_vaddr, wdata[p_offset:p_offset + p_filesz])
+        mu.mem_write(WBASE + p_vaddr, wdata[p_offset:p_offset + p_filesz])
         wrapper_va_ranges.append((va_start, va_end))
 
-    WBASE = 0
-    WRAPPER_END = 0x7dc0818
-    PLT_LO_VA = 0x7ae5ba0
-    PLT_HI_VA = 0x7ae5b90 + 793*16
+    WRAPPER_END = WBASE + 0x7dc0818
+    PLT_LO_VA = WBASE + 0x7ae5ba0
+    PLT_HI_VA = WBASE + 0x7ae5b90 + 793*16
 
     # Map shared arena into Unicorn at SAME VA
     mu.mem_map_ptr(arena_addr, SHARED_ARENA_SIZE,
@@ -204,7 +203,7 @@ def main():
     libfwd_calls = {'attempted': 0, 'forwarded': 0, 'noop': 0}
 
     def stub_handle(uc, plt_va):
-        plt_off = plt_va
+        plt_off = plt_va - WBASE
         plt_idx = (plt_off - 0x7ae5ba0) // 16
         plt_entry = 0x7ae5ba0 + plt_idx * 16
         name = plt_addr_to_name.get(plt_entry, f'plt+0x{plt_off:x}')
@@ -425,22 +424,12 @@ def main():
             last_insns.append((address, None, exec_count[0]))
         if len(last_insns) > 80: last_insns.pop(0)
 
-        # Hack: replace enter at 0x5cd2dfb with simpler push rbp; sub rsp, 0xf7a1
-        if address == 0x5cd2dfb:
-            old_rsp = uc.reg_read(UC_X86_REG_RSP)
-            old_rbp = uc.reg_read(UC_X86_REG_RBP)
-            new_rsp = old_rsp - 8
-            uc.mem_write(new_rsp, struct.pack('<Q', old_rbp))
-            new_rbp = new_rsp
-            new_rsp -= 0xf799
-            uc.reg_write(UC_X86_REG_RSP, new_rsp)
-            uc.reg_write(UC_X86_REG_RBP, new_rbp)
-            uc.reg_write(UC_X86_REG_RIP, address + 4)
-            uc.emu_stop()  # force Unicorn to re-fetch from new RIP
+        # (removed enter skip — testing if high WBASE fixes root cause)
         if PLT_LO_VA <= address < PLT_HI_VA:
             stub_handle(uc, address)
             return
-        if not (WBASE <= address < WRAPPER_END) and not (SHARED_ARENA_VA <= address < SHARED_ARENA_VA + SHARED_ARENA_SIZE):
+        if not (WBASE <= address < WRAPPER_END) and \
+           not (SHARED_ARENA_VA <= address < SHARED_ARENA_VA + SHARED_ARENA_SIZE):
             # External or weird; treat as PLT-like
             rsp = uc.reg_read(UC_X86_REG_RSP)
             ret_addr = struct.unpack('<Q', bytes(uc.mem_read(rsp, 8)))[0]
@@ -476,7 +465,7 @@ def main():
     mu.reg_write(UC_X86_REG_RCX, 1)
     mu.reg_write(UC_X86_REG_R8, out_va)
 
-    SIGN_FN = 0x56D81D1
+    SIGN_FN = WBASE + 0x56D81D1
     print(f"[+] Calling sign_fn at 0x{SIGN_FN:x}")
     import time
     t0 = time.time()
