@@ -123,10 +123,14 @@ def stub_handle(uc, plt_va):
     if name in ('malloc','_Znwm','_Znam','_ZnwmRKSt9nothrow_t'):
         ret_val = alloc(rdi)
     elif name in ('memcpy','memmove'):
-        if rdx > 0: uc.mem_write(rdi, bytes(uc.mem_read(rsi, rdx)))
+        if 0 < rdx < 0x100000:
+            try: uc.mem_write(rdi, bytes(uc.mem_read(rsi, rdx)))
+            except UcError: pass
         ret_val = rdi
     elif name == 'memset':
-        if rdx > 0: uc.mem_write(rdi, bytes([rsi & 0xff]) * rdx)
+        if 0 < rdx < 0x100000:
+            try: uc.mem_write(rdi, bytes([rsi & 0xff]) * rdx)
+            except UcError: pass
         ret_val = rdi
     elif name == 'strlen':
         sz = 0
@@ -243,6 +247,40 @@ def stub_handle(uc, plt_va):
                   '_ZSt20__throw_system_errori',
                   'fopen', 'fgets', 'fclose'):
         ret_val = 0
+    elif name == '_ZNSt6thread15_M_start_threadESt10unique_ptrINS_6_StateESt14default_deleteIS1_EEPFvvE':
+        # std::thread::_M_start_thread(unique_ptr<_State>, void(*)())
+        # rdi = thread*, rsi = unique_ptr<_State>* (rvalue ref to state ptr), rdx = original_fn_ptr
+        thread_ptr = rdi
+        # Set thread._M_id to non-zero (pretend thread started)
+        uc.mem_write(thread_ptr, struct.pack('<Q', 0xDEAD0001))
+        # CRITICAL: NULL the unique_ptr to transfer ownership.
+        # Caller does `mov rdi, [r14]; test rdi, rdi; je skip` — if NULL, skip
+        # the vtable deref / destructor call.
+        uc.mem_write(rsi, struct.pack('<Q', 0))
+        ret_val = 0
+    elif name == '_ZNSt6thread4joinEv':
+        # std::thread::join() — pretend it succeeded
+        thread_ptr = rdi
+        # Reset _M_id to 0 (joinable to non-joinable)
+        uc.mem_write(thread_ptr, struct.pack('<Q', 0))
+        ret_val = 0
+    elif name in ('_ZNSt13__future_base12_Result_baseC2Ev',
+                  '_ZNSt13__future_base12_Result_baseD2Ev'):
+        # std::__future_base::_Result_base ctor/dtor — no-op
+        ret_val = rdi
+    elif name == 'syscall':
+        # Various syscalls — return 0 (success-ish)
+        ret_val = 0
+    elif name == 'vsnprintf':
+        s = rdi; n = rsi
+        if s and n > 0: uc.mem_write(s, b'\x00')
+        ret_val = 0
+    elif name == 'dladdr':
+        ret_val = 0  # failure
+    elif name == 'sprintf':
+        s = rdi
+        if s: uc.mem_write(s, b'\x00')
+        ret_val = 0
     elif name == '__tls_get_addr':
         ret_val = alloc(256)
     elif name == 'snprintf':
@@ -263,8 +301,11 @@ def stub_handle(uc, plt_va):
 
 md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
 exec_count = [0]
+last_insns = []
 def hook_code(uc, address, size, user_data):
     exec_count[0] += 1
+    last_insns.append(address)
+    if len(last_insns) > 30: last_insns.pop(0)
     if PLT_LO_VA <= address < PLT_HI_VA:
         stub_handle(uc, address)
         return
@@ -295,6 +336,14 @@ except UcError as e:
     print(f"  UcError after {time.time()-t0:.2f}s, {exec_count[0]} insns: {e}")
     rip = mu.reg_read(UC_X86_REG_RIP)
     print(f"  RIP at error: 0x{rip:x} (offset 0x{rip-WBASE:x})")
+    print(f"\nLast 25 insns before failure:")
+    for a in last_insns[-25:]:
+        try:
+            b = bytes(mu.mem_read(a, 16))
+            ins = next(md.disasm(b, a), None)
+            mnem = f"{ins.mnemonic} {ins.op_str}" if ins else "???"
+        except: mnem = "??"
+        print(f"  0x{a-WBASE:x}: {mnem}")
 
 # Read output buffer
 out = bytes(mu.mem_read(OUT_VA, 0x300))
