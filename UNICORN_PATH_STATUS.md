@@ -1,3 +1,32 @@
+# Native-Elimination Path: Status Snapshot
+
+## TL;DR
+- **`no_frida_sign.NoFridaSignProvider`** (production-ready): ONE ctypes call per
+  unique (cmd, src) bootstrap, then pure Python forever via `pure_cipher`.
+- **`pure_native_free_sign.PureNativeFreeSignProvider`** (this session): drop-in
+  same-API wrapper; currently delegates to no_frida_sign, will become truly
+  native-free when Unicorn end-to-end emulation is completed.
+- **Multi-week effort remaining** to complete Unicorn stubs. This session laid
+  the infrastructure (95% of stubs implemented) and decompiled the binary
+  via IDA Pro to confirm the architecture.
+
+## Critical Finding from IDA Pro Decompilation (this session)
+
+The "op 0x60 hash" we sought is **NOT** a single Python-portable function:
+- `sub_5CCD94A` (op 0x60 outer): a vector-intern operation (find or insert
+  index in deduplicated vector)
+- `sub_5CE6006` (op60_helper): wrapper around vector intern
+- `sub_5CE6230`: just `std::find`
+- `sub_5CE5A3E`: cleanup/init helper
+
+The X_b1_init values (`0x114D0B11` etc.) are produced by the CUMULATIVE state
+of running the entire VM (16,198 steps via `sub_56C46C0` block 1 cipher
+orchestration → `sub_56B4244` 60KB VM dispatcher → `sub_5CCC307` main loop).
+
+**Implication**: pure-Python sign requires emulating the entire sign() flow,
+not just a single hash function. This validates the Unicorn/Qiling approach
+as architecturally correct.
+
 # Unicorn-Emulation Path: Final Status Snapshot
 
 ## Goal
