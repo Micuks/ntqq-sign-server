@@ -418,13 +418,25 @@ def main():
     def hook_code(uc, address, size, user_data):
         exec_count[0] += 1
         if address in (0x5cd5c1a, 0x5cd5c21):
-            # Dump regs at the failure region
             regs = (uc.reg_read(UC_X86_REG_RAX), uc.reg_read(UC_X86_REG_RBP),
                     uc.reg_read(UC_X86_REG_RBX), uc.reg_read(UC_X86_REG_RDI))
             last_insns.append((address, regs, exec_count[0]))
         else:
             last_insns.append((address, None, exec_count[0]))
         if len(last_insns) > 80: last_insns.pop(0)
+
+        # Hack: replace enter at 0x5cd2dfb with simpler push rbp; sub rsp, 0xf7a1
+        if address == 0x5cd2dfb:
+            old_rsp = uc.reg_read(UC_X86_REG_RSP)
+            old_rbp = uc.reg_read(UC_X86_REG_RBP)
+            new_rsp = old_rsp - 8
+            uc.mem_write(new_rsp, struct.pack('<Q', old_rbp))
+            new_rbp = new_rsp
+            new_rsp -= 0xf799
+            uc.reg_write(UC_X86_REG_RSP, new_rsp)
+            uc.reg_write(UC_X86_REG_RBP, new_rbp)
+            uc.reg_write(UC_X86_REG_RIP, address + 4)
+            uc.emu_stop()  # force Unicorn to re-fetch from new RIP
         if PLT_LO_VA <= address < PLT_HI_VA:
             stub_handle(uc, address)
             return
@@ -468,9 +480,25 @@ def main():
     print(f"[+] Calling sign_fn at 0x{SIGN_FN:x}")
     import time
     t0 = time.time()
+    # Loop emu_start; some hooks stop emulation to advance RIP (e.g., enter skip)
+    cur_pc = SIGN_FN
+    prev_pc = -1
     try:
-        mu.emu_start(SIGN_FN, SENTINEL, count=20_000_000)
-        print(f"  Finished after {time.time()-t0:.2f}s, {exec_count[0]} insns")
+        while exec_count[0] < 20_000_000 and cur_pc != SENTINEL:
+            try:
+                mu.emu_start(cur_pc, SENTINEL, count=20_000_000 - exec_count[0])
+            except UcError as e:
+                # Re-raise to outer except for diagnostics
+                raise
+            new_pc = mu.reg_read(UC_X86_REG_RIP)
+            if new_pc == SENTINEL: break
+            if new_pc == prev_pc:
+                # Stuck; abort
+                print(f"  STUCK at 0x{new_pc:x}")
+                break
+            prev_pc = cur_pc
+            cur_pc = new_pc
+        print(f"  Finished after {time.time()-t0:.2f}s, {exec_count[0]} insns, RIP=0x{cur_pc:x}")
     except UcError as e:
         print(f"  UcError after {time.time()-t0:.2f}s, {exec_count[0]} insns: {e}")
         rip = mu.reg_read(UC_X86_REG_RIP)
