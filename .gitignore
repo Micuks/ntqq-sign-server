@@ -7,3 +7,13 @@ libcrbase.so
 *.o
 __pycache__/
 *.pyc
+
+# IDA Pro database files
+*.id0
+*.id1
+*.id2
+*.idb
+*.i64
+*.til
+*.nam
+
