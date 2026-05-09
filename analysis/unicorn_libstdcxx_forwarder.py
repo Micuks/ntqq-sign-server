@@ -496,17 +496,22 @@ def main():
             stub_handle(uc, address)
             return
         # If RIP enters arena (heap/stack data), it's a corrupt indirect call.
-        # Simulate ret to recover caller's flow.
+        # Scan stack for any wrapper.node return address and unwind to it.
         if SHARED_ARENA_VA <= address < SHARED_ARENA_VA + SHARED_ARENA_SIZE:
             rsp = uc.reg_read(UC_X86_REG_RSP)
-            try:
-                ret_addr = struct.unpack('<Q', bytes(uc.mem_read(rsp, 8)))[0]
-            except UcError:
-                ret_addr = 0
-            if WBASE <= ret_addr < WRAPPER_END:
-                uc.reg_write(UC_X86_REG_RAX, 0)
-                uc.reg_write(UC_X86_REG_RSP, rsp + 8)
-                uc.reg_write(UC_X86_REG_RIP, ret_addr)
+            recovered = False
+            for off in range(0, 256, 8):
+                try:
+                    cand = struct.unpack('<Q', bytes(uc.mem_read(rsp + off, 8)))[0]
+                except UcError:
+                    break
+                if WBASE <= cand < WRAPPER_END:
+                    uc.reg_write(UC_X86_REG_RAX, 0)
+                    uc.reg_write(UC_X86_REG_RSP, rsp + off + 8)
+                    uc.reg_write(UC_X86_REG_RIP, cand)
+                    recovered = True
+                    break
+            if recovered:
                 uc.emu_stop()
                 return
         if not (WBASE <= address < WRAPPER_END) and \
