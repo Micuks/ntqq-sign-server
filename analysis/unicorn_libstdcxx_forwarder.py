@@ -413,9 +413,24 @@ def main():
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     exec_count = [0]
     last_insns = []  # (addr, regs_snapshot)
+    chain_log = []
+    rcx_changes = []
+    last_rcx = [0]
 
+    skipped_reads = [0]
+    fixup_done = [False]
     def hook_code(uc, address, size, user_data):
         exec_count[0] += 1
+        # Right before the failing chain, patch struct[+0x20] at absolute addr
+        # 0x5000007efa10 = 0x5000007ef9f0 + 0x20. Use struct[+0x18] as guess.
+        STRUCT_ABS = 0x5000007ef9f0
+        if exec_count[0] == 42600 and not fixup_done[0]:
+            try:
+                v_18 = struct.unpack('<Q', bytes(uc.mem_read(STRUCT_ABS + 0x18, 8)))[0]
+                uc.mem_write(STRUCT_ABS + 0x20, struct.pack('<Q', v_18))
+                print(f"  [fixup] insn 42600 — struct[+0x20] set to struct[+0x18]=0x{v_18:x}")
+                fixup_done[0] = True
+            except UcError as e: print(f"  [fixup] err: {e}")
         if address in (0x5cd5c1a, 0x5cd5c21):
             regs = (uc.reg_read(UC_X86_REG_RAX), uc.reg_read(UC_X86_REG_RBP),
                     uc.reg_read(UC_X86_REG_RBX), uc.reg_read(UC_X86_REG_RDI))
@@ -423,6 +438,26 @@ def main():
         else:
             last_insns.append((address, None, exec_count[0]))
         if len(last_insns) > 80: last_insns.pop(0)
+        # Capture rcx,rdi at the indirection chain that produces the ELF magic
+        if address in (0x5ccd06d, 0x5ccd072, 0x5ccd075, 0x5ccd079):
+            chain_log.append((exec_count[0], address,
+                              uc.reg_read(UC_X86_REG_RCX),
+                              uc.reg_read(UC_X86_REG_RDI),
+                              uc.reg_read(UC_X86_REG_RSP),
+                              uc.reg_read(UC_X86_REG_RBP)))
+        # Track when rcx changes (within last 5000 insns before fail)
+        if exec_count[0] > 37000 and exec_count[0] < 42700:
+            rcx = uc.reg_read(UC_X86_REG_RCX)
+            if rcx != last_rcx[0]:
+                rcx_changes.append((exec_count[0], address, last_rcx[0], rcx))
+                last_rcx[0] = rcx
+        # Log EVERY instruction in narrow window before fail to find rcx-zeroing
+        if 42617 <= exec_count[0] <= 42680:
+            chain_log.append((exec_count[0], address,
+                              uc.reg_read(UC_X86_REG_RCX),
+                              uc.reg_read(UC_X86_REG_RDI),
+                              uc.reg_read(UC_X86_REG_RAX),
+                              uc.reg_read(UC_X86_REG_RBX)))
 
         # (removed enter skip — testing if high WBASE fixes root cause)
         if PLT_LO_VA <= address < PLT_HI_VA:
@@ -444,14 +479,30 @@ def main():
         return False
     mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED, hook_invalid)
 
-    # Watchpoint on the corrupted location 0x5000007ef528 — log ALL writes
+    # Watch entire stack range; filter values matching ELF magic patterns.
     from unicorn import UC_HOOK_MEM_WRITE
     write_log = []
+    struct_writes = []
+    ELF_MAGIC = 0x10102464c457f
+    STRUCT_BASE = 0x5000007ef9f0
+    STRUCT_END = STRUCT_BASE + 0x40
     def hook_write(uc, access, address, size, value, user_data):
-        rip = uc.reg_read(UC_X86_REG_RIP)
-        write_log.append((rip, address, size, value, exec_count[0]))
-    # Narrow watchpoint to just the 8 bytes we care about
-    mu.hook_add(UC_HOOK_MEM_WRITE, hook_write, begin=0x5000007ef528, end=0x5000007ef530)
+        # Track ALL writes to the suspected struct (r14 base + 64 bytes)
+        if STRUCT_BASE <= address < STRUCT_END:
+            rip = uc.reg_read(UC_X86_REG_RIP)
+            struct_writes.append((exec_count[0], rip, address, size, value))
+        # Only stack range
+        if not (arena_addr <= address < arena_addr + 0x800000): return
+        if size != 8: return
+        # Match if value is ELF_MAGIC, ELF_MAGIC+small offset, or contains the magic bytes
+        v = value & ((1 << (size*8)) - 1)
+        is_magic = (v == ELF_MAGIC) or (ELF_MAGIC <= v <= ELF_MAGIC + 0x100) or \
+                   ((v >> 8) == (ELF_MAGIC >> 8) and (v & 0xFF) <= 0x20)
+        if is_magic:
+            rip = uc.reg_read(UC_X86_REG_RIP)
+            write_log.append((rip, address, size, value, exec_count[0]))
+    mu.hook_add(UC_HOOK_MEM_WRITE, hook_write,
+                begin=arena_addr, end=arena_addr + 0x800000)
 
     # Set up call — stack now in shared arena (top-down)
     SENTINEL = 0xCAFEBABEDEAD000
@@ -527,9 +578,20 @@ def main():
 
     print(f"\nlibfwd_calls (M_construct_PKc): {libfwd_calls}")
 
-    print(f"\nWrites to [rbp-0x3e8] (0x5000007ef528): {len(write_log)} total")
-    for rip, addr, size, value, exc in write_log[-30:]:
-        print(f"  insn={exc} RIP=0x{rip:x} (off 0x{rip:x}) write 0x{value:x} (sz={size}) to 0x{addr:x}")
+    print(f"\nELF-magic-pattern writes to stack: {len(write_log)} total")
+    for rip, addr, size, value, exc in write_log[:80]:
+        print(f"  insn={exc} RIP=0x{rip:x} write 0x{value:x} (sz={size}) to 0x{addr:x}")
+
+    print(f"\nSkipped reads at 0x5cd5c21: {skipped_reads[0]}")
+
+    print(f"\nLast 30 rcx changes (insn 37000..42700):")
+    for exc, addr, old, new in rcx_changes[-30:]:
+        try:
+            b = bytes(mu.mem_read(addr, 16))
+            ins = next(md.disasm(b, addr), None)
+            ins_str = f"{ins.mnemonic} {ins.op_str}" if ins else '?'
+        except: ins_str = '?'
+        print(f"  insn={exc} RIP=0x{addr:x} {ins_str:40s} rcx 0x{old:x} -> 0x{new:x}")
     print(f"\nInvalid memory accesses: {len(invalid_log)}")
     for rip, acc, addr, sz in invalid_log[:5]:
         print(f"  RIP=0x{rip:x} access={acc} addr=0x{addr:x} sz={sz}")
