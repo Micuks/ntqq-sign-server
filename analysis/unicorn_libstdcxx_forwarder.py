@@ -418,19 +418,17 @@ def main():
     last_rcx = [0]
 
     skipped_reads = [0]
+    # Restore [+0x20] fixup (advanced 80 insns past the ELF-magic blocker)
     fixup_done = [False]
     def hook_code(uc, address, size, user_data):
         exec_count[0] += 1
-        # Right before the failing chain, patch struct[+0x20] at absolute addr
-        # 0x5000007efa10 = 0x5000007ef9f0 + 0x20. Use struct[+0x18] as guess.
         STRUCT_ABS = 0x5000007ef9f0
         if exec_count[0] == 42600 and not fixup_done[0]:
             try:
                 v_18 = struct.unpack('<Q', bytes(uc.mem_read(STRUCT_ABS + 0x18, 8)))[0]
                 uc.mem_write(STRUCT_ABS + 0x20, struct.pack('<Q', v_18))
-                print(f"  [fixup] insn 42600 — struct[+0x20] set to struct[+0x18]=0x{v_18:x}")
                 fixup_done[0] = True
-            except UcError as e: print(f"  [fixup] err: {e}")
+            except UcError: pass
         if address in (0x5cd5c1a, 0x5cd5c21):
             regs = (uc.reg_read(UC_X86_REG_RAX), uc.reg_read(UC_X86_REG_RBP),
                     uc.reg_read(UC_X86_REG_RBX), uc.reg_read(UC_X86_REG_RDI))
