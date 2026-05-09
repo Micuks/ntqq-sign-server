@@ -159,9 +159,11 @@ def main():
     PLT_LO_VA = WBASE + 0x7ae5ba0
     PLT_HI_VA = WBASE + 0x7ae5b90 + 793*16
 
-    # Map shared arena into Unicorn at SAME VA
+    # Map shared arena into Unicorn at SAME VA — make it executable too so
+    # any stray RIP jump into heap can be intercepted via INSN_INVALID and
+    # redirected, rather than failing on fetch.
     mu.mem_map_ptr(arena_addr, SHARED_ARENA_SIZE,
-                   UC_PROT_READ | UC_PROT_WRITE,
+                   UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC,
                    arena_addr)
     print(f"[+] Mapped arena into Unicorn at 0x{arena_addr:x}")
 
@@ -490,13 +492,25 @@ def main():
                               uc.reg_read(UC_X86_REG_RAX),
                               uc.reg_read(UC_X86_REG_RBX)))
 
-        # (removed enter skip — testing if high WBASE fixes root cause)
         if PLT_LO_VA <= address < PLT_HI_VA:
             stub_handle(uc, address)
             return
+        # If RIP enters arena (heap/stack data), it's a corrupt indirect call.
+        # Simulate ret to recover caller's flow.
+        if SHARED_ARENA_VA <= address < SHARED_ARENA_VA + SHARED_ARENA_SIZE:
+            rsp = uc.reg_read(UC_X86_REG_RSP)
+            try:
+                ret_addr = struct.unpack('<Q', bytes(uc.mem_read(rsp, 8)))[0]
+            except UcError:
+                ret_addr = 0
+            if WBASE <= ret_addr < WRAPPER_END:
+                uc.reg_write(UC_X86_REG_RAX, 0)
+                uc.reg_write(UC_X86_REG_RSP, rsp + 8)
+                uc.reg_write(UC_X86_REG_RIP, ret_addr)
+                uc.emu_stop()
+                return
         if not (WBASE <= address < WRAPPER_END) and \
            not (SHARED_ARENA_VA <= address < SHARED_ARENA_VA + SHARED_ARENA_SIZE):
-            # External or weird; treat as PLT-like
             rsp = uc.reg_read(UC_X86_REG_RSP)
             ret_addr = struct.unpack('<Q', bytes(uc.mem_read(rsp, 8)))[0]
             uc.reg_write(UC_X86_REG_RAX, alloc(64))
@@ -504,11 +518,32 @@ def main():
             uc.reg_write(UC_X86_REG_RIP, ret_addr)
     mu.hook_add(UC_HOOK_CODE, hook_code)
 
+    from unicorn import UC_HOOK_MEM_WRITE_PROT, UC_HOOK_MEM_READ_PROT, UC_HOOK_MEM_FETCH_PROT
     invalid_log = []
+    skipped_invalids = [0]
     def hook_invalid(uc, access, address, size, value, user_data):
-        invalid_log.append((uc.reg_read(UC_X86_REG_RIP), access, address, size))
-        return False
+        rip = uc.reg_read(UC_X86_REG_RIP)
+        invalid_log.append((rip, access, address, size))
+        try:
+            page = address & ~0xfff
+            mu.mem_map(page, 0x1000, UC_PROT_READ | UC_PROT_WRITE)
+            skipped_invalids[0] += 1
+            return True
+        except UcError:
+            return False
+    def hook_prot(uc, access, address, size, value, user_data):
+        rip = uc.reg_read(UC_X86_REG_RIP)
+        invalid_log.append((rip, access, address, size))
+        # Add write permission to the page
+        try:
+            page = address & ~0xfff
+            mu.mem_protect(page, 0x1000, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC)
+            skipped_invalids[0] += 1
+            return True
+        except UcError:
+            return False
     mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED, hook_invalid)
+    mu.hook_add(UC_HOOK_MEM_WRITE_PROT | UC_HOOK_MEM_READ_PROT | UC_HOOK_MEM_FETCH_PROT, hook_prot)
 
     # Watch entire stack range; filter values matching ELF magic patterns.
     from unicorn import UC_HOOK_MEM_WRITE
@@ -598,6 +633,11 @@ def main():
             print(f"  reading stack failed: {e}")
 
     out = bytes(mu.mem_read(out_va, 0x300))
+    print(f"\n  out FULL hex (looking for cipher activity):")
+    for i in range(0, 0x300, 32):
+        chunk = out[i:i+32]
+        if any(b != 0 for b in chunk):
+            print(f"    +0x{i:03x}: {chunk.hex()}")
     print(f"\n  out[0x200:0x220]: {out[0x200:0x220].hex()}")
     expected = 'e957228ae560df16aaded8b75d19773f6966feb7d70136e14ee9b1bd3531ec5f' if src_byte == 0 else \
                '9fb5974211ac4e148579b26575ecc8c34f3dfd82728cecaf00ab0bfb394186e3'
@@ -615,6 +655,7 @@ def main():
         print(f"  insn={exc} RIP=0x{rip:x} write 0x{value:x} (sz={size}) to 0x{addr:x}")
 
     print(f"\nSkipped reads at 0x5cd5c21: {skipped_reads[0]}")
+    print(f"On-demand mapped invalid pages: {skipped_invalids[0]}")
     print(f"\nFailure-window instructions (42780..42830, last 50):")
     for exc, a, rax, rbx, rcx, rdx, rsi, rdi, rbp in fail_window[-50:]:
         try:
