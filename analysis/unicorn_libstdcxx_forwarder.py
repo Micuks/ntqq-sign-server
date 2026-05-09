@@ -418,17 +418,50 @@ def main():
     last_rcx = [0]
 
     skipped_reads = [0]
-    # Restore [+0x20] fixup (advanced 80 insns past the ELF-magic blocker)
     fixup_done = [False]
+    fail_window = []
     def hook_code(uc, address, size, user_data):
         exec_count[0] += 1
         STRUCT_ABS = 0x5000007ef9f0
         if exec_count[0] == 42600 and not fixup_done[0]:
             try:
-                v_18 = struct.unpack('<Q', bytes(uc.mem_read(STRUCT_ABS + 0x18, 8)))[0]
-                uc.mem_write(STRUCT_ABS + 0x20, struct.pack('<Q', v_18))
+                v_10 = struct.unpack('<Q', bytes(uc.mem_read(STRUCT_ABS + 0x10, 8)))[0]
+                # [+0x10]=index vec base, [+0x18]=flag array base. The chain at
+                # 0x5ccd075 reads [rcx + rdi*8] — rcx should be index vec base.
+                uc.mem_write(STRUCT_ABS + 0x20, struct.pack('<Q', v_10))
+                print(f"  [fixup] [+0x20] := [+0x10] = 0x{v_10:x}")
                 fixup_done[0] = True
             except UcError: pass
+        # Capture window around new failure at insn ~42818, RIP=0x5cd32b0
+        if 42780 <= exec_count[0] <= 42830:
+            try:
+                fail_window.append((exec_count[0], address,
+                                    uc.reg_read(UC_X86_REG_RAX),
+                                    uc.reg_read(UC_X86_REG_RBX),
+                                    uc.reg_read(UC_X86_REG_RCX),
+                                    uc.reg_read(UC_X86_REG_RDX),
+                                    uc.reg_read(UC_X86_REG_RSI),
+                                    uc.reg_read(UC_X86_REG_RDI),
+                                    uc.reg_read(UC_X86_REG_RBP)))
+            except UcError: pass
+        # Dump candidate heap content around failure
+        if exec_count[0] == 42810:
+            try:
+                rbp = uc.reg_read(UC_X86_REG_RBP)
+                p = struct.unpack('<Q', bytes(uc.mem_read(rbp - 0x3e8, 8)))[0]
+                print(f"  [pre-fail] [rbp-0x3e8] = 0x{p:x}")
+                # Dump index vec at 0xca0 (160 bytes = 20 entries)
+                blob1 = bytes(uc.mem_read(0x500001000ca0, 160))
+                print(f"  [pre-fail] [0x500001000ca0..+160]:")
+                for i in range(0, 160, 16):
+                    print(f"    +0x{i:02x}: {blob1[i:i+16].hex()}")
+                # Dump flag array
+                blob2 = bytes(uc.mem_read(0x500001000d40, 32))
+                print(f"  [pre-fail] [0x500001000d40..+32] = {blob2.hex()}")
+            except UcError as e: print(f"  [pre-fail] err: {e}")
+        # Track rdi at the chain critical loads
+        if address in (0x5ccd075, 0x5ccd079) and 42670 <= exec_count[0] <= 42685:
+            print(f"  [chain] insn={exec_count[0]} 0x{address:x} rdi=0x{uc.reg_read(UC_X86_REG_RDI):x} rcx=0x{uc.reg_read(UC_X86_REG_RCX):x}")
         if address in (0x5cd5c1a, 0x5cd5c21):
             regs = (uc.reg_read(UC_X86_REG_RAX), uc.reg_read(UC_X86_REG_RBP),
                     uc.reg_read(UC_X86_REG_RBX), uc.reg_read(UC_X86_REG_RDI))
@@ -501,6 +534,7 @@ def main():
             write_log.append((rip, address, size, value, exec_count[0]))
     mu.hook_add(UC_HOOK_MEM_WRITE, hook_write,
                 begin=arena_addr, end=arena_addr + 0x800000)
+
 
     # Set up call — stack now in shared arena (top-down)
     SENTINEL = 0xCAFEBABEDEAD000
@@ -581,6 +615,14 @@ def main():
         print(f"  insn={exc} RIP=0x{rip:x} write 0x{value:x} (sz={size}) to 0x{addr:x}")
 
     print(f"\nSkipped reads at 0x5cd5c21: {skipped_reads[0]}")
+    print(f"\nFailure-window instructions (42780..42830, last 50):")
+    for exc, a, rax, rbx, rcx, rdx, rsi, rdi, rbp in fail_window[-50:]:
+        try:
+            b = bytes(mu.mem_read(a, 16))
+            ins = next(md.disasm(b, a), None)
+            ins_str = f"{ins.mnemonic} {ins.op_str}" if ins else '?'
+        except: ins_str = '?'
+        print(f"  insn={exc} 0x{a:x}: {ins_str:55s} rax=0x{rax:x} rbx=0x{rbx:x} rdi=0x{rdi:x}")
 
     print(f"\nLast 30 rcx changes (insn 37000..42700):")
     for exc, addr, old, new in rcx_changes[-30:]:
