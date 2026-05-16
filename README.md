@@ -31,6 +31,21 @@ python3 sign.py --wrapper /path/to/wrapper.node --port 8080
 
 The signing function offset is auto-detected. If auto-detection fails, specify it manually with `--offset 0x56D81D1`.
 
+### Pure-Python server (`pure_sign_server.py`)
+
+Drop-in replacement for `sign.py` that calls native `wrapper.node` **once per unique
+`(cmd, src)`**, then handles every subsequent `ctr` value entirely in Python via
+`pure_cipher`. On a populated `no_frida_cache.json` no native call is made at all.
+
+```bash
+# Optional one-time prewarm so the first HTTP request doesn't pay the native cost
+python3 pure_sign_server.py --port 8080 --prewarm wtlogin.login \
+    trpc.qq_new_tech.status_svc.SsoHeartBeat
+```
+
+Same HTTP API as `sign.py`. See `/stats` for `native_calls` vs `cache_hits`.
+Adds `ctr` query/body parameter (default `100`) — controls X_b2[0] high 16 bits.
+
 ### Docker
 
 ```bash

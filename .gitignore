@@ -1,5 +1,7 @@
 wrapper.node
 wrapper.node.gz
+no_frida_cache.json
+oracle_cache.json
 libsymbols.so
 libvips-cpp.so*
 libbugly.so

@@ -84,12 +84,29 @@ class _NativeSign:
 
     def sign(self, cmd: bytes, src: bytes, ctr: int = 100) -> bytes:
         """Invoke wrapper.node's native sign function. Returns 32-byte sign."""
+        return self.sign_full(cmd, src, ctr)["sign"]
+
+    def sign_full(self, cmd: bytes, src: bytes, ctr: int = 100) -> dict:
+        """Invoke wrapper.node's native sign function. Returns full output.
+
+        The output buffer is 0x300 bytes: 0x000..0x0FF = token (length at 0x0FF),
+        0x100..0x1FF = extra (length at 0x1FF), 0x200..0x2FF = sign (length at 0x2FF).
+        """
+        if not src:
+            src = b"\x00"
         sb = (ctypes.c_ubyte * len(src))(*src)
         out = (ctypes.c_ubyte * 0x300)()
         ctypes.c_uint32.from_address(self._counter_addr).value = ctr
         self._sf(cmd, sb, len(src), 1, out)
-        sign_len = bytes(out)[0x2FF]
-        return bytes(out)[0x200:0x200 + sign_len]
+        raw = bytes(out)
+        token_len = raw[0xFF]
+        extra_len = raw[0x1FF]
+        sign_len = raw[0x2FF]
+        return {
+            "sign": raw[0x200:0x200 + sign_len],
+            "extra": raw[0x100:0x100 + extra_len],
+            "token": raw[0x000:0x000 + token_len],
+        }
 
 
 # ----------------------------------------------------------------------------
@@ -137,7 +154,26 @@ class NoFridaSignProvider:
 
     def sign(self, cmd: str, src: bytes, ctr: int = 100) -> bytes:
         """Sign (cmd, src) for the given ctr. Returns 32 bytes."""
+        return self._sign_internal(cmd, src, ctr)["sign_bytes"]
+
+    def sign_packet(self, cmd: str, seq: int, src: bytes, ctr: int = 100) -> dict:
+        """Sign packet, returning {sign, extra, token} as uppercase hex strings.
+
+        Compatible with sign.NativeSignProvider.sign signature minus the seq arg's
+        impact: seq is unused for the cipher (X_b1_init/X_b2[1] don't depend on
+        seq); ctr controls X_b2[0] high 16 bits. Caller may pass any seq value.
+        """
+        result = self._sign_internal(cmd, src, ctr)
+        return {
+            "sign": result["sign_bytes"].hex().upper(),
+            "extra": result["extra"].hex().upper(),
+            "token": result["token"].hex().upper(),
+        }
+
+    def _sign_internal(self, cmd: str, src: bytes, ctr: int) -> dict:
         cmd_b = cmd.encode() if isinstance(cmd, str) else cmd
+        if not src:
+            src = b"\x00"
         md5 = hashlib.md5(src).hexdigest()
         key = f"{cmd}|{md5}"
         with self._lock:
@@ -145,19 +181,27 @@ class NoFridaSignProvider:
         if entry is None:
             entry = self._populate(cmd_b, src, key)
         self._cache_hits += 1
-        x_b1 = [int(v, 16) for v in entry["x_b1"]]
-        x_b2_1 = int(entry["x_b2_1"], 16)
+        token_b = bytes.fromhex(entry.get("token", ""))
+        extra_b = bytes.fromhex(entry.get("extra", ""))
         # Special-case the bootstrap ctr — return cached native sign directly
         if entry.get("native_ctr") == ctr and entry.get("native_sign"):
-            return bytes.fromhex(entry["native_sign"])
-        return pure_cipher.compute_sign_from_block1_and_nonce(x_b1, x_b2_1, ctr=ctr)
+            return {
+                "sign_bytes": bytes.fromhex(entry["native_sign"]),
+                "extra": extra_b,
+                "token": token_b,
+            }
+        x_b1 = [int(v, 16) for v in entry["x_b1"]]
+        x_b2_1 = int(entry["x_b2_1"], 16)
+        sig = pure_cipher.compute_sign_from_block1_and_nonce(x_b1, x_b2_1, ctr=ctr)
+        return {"sign_bytes": sig, "extra": extra_b, "token": token_b}
 
     def _populate(self, cmd: bytes, src: bytes, key: str) -> dict:
         self._ensure_native()
         assert self._native is not None
         # Fixed bootstrap ctr — reproducible and avoids ctr-dependent recovery edge cases.
         bootstrap_ctr = 100
-        sig = self._native.sign(cmd, src, ctr=bootstrap_ctr)
+        full = self._native.sign_full(cmd, src, ctr=bootstrap_ctr)
+        sig = full["sign"]
         self._native_calls += 1
         if len(sig) != 32:
             raise RuntimeError(f"Native sign returned unexpected length {len(sig)}")
@@ -167,6 +211,8 @@ class NoFridaSignProvider:
             "x_b2_1": f"{x2[1]:08x}",
             "native_ctr": bootstrap_ctr,
             "native_sign": sig.hex(),
+            "extra": full["extra"].hex(),
+            "token": full["token"].hex(),
         }
         with self._lock:
             self._cache[key] = entry
