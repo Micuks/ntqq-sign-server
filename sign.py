@@ -7,12 +7,18 @@ to produce sign/extra/token values for whitelisted SSO commands.
 
 import ctypes
 import ctypes.util
+import logging
 import os
 import sys
 import struct
 import json
 import mmap
+import threading
+import time
 from ctypes import c_char_p, c_ubyte, c_uint, c_int, c_longlong, POINTER, CFUNCTYPE
+from socketserver import ThreadingMixIn
+
+log = logging.getLogger("ntqq-sign")
 
 # --- Configuration ---
 
@@ -171,6 +177,11 @@ class NativeSignProvider:
         ]
         self._func = None
         self._handles = []
+        # Native call must be serialized — wrapper.node maintains global VM state
+        # and PRNG counter; concurrent calls produce non-deterministic garbage.
+        self._call_lock = threading.Lock()
+        self._call_count = 0
+        self._total_native_ms = 0.0
 
     def load(self):
         """Load wrapper.node and resolve the signing function."""
@@ -247,20 +258,30 @@ class NativeSignProvider:
         self._func = SignFunc(func_addr)
 
     def sign(self, cmd: str, seq: int, src: bytes) -> dict:
-        """Sign a packet and return {sign, extra, token} as hex strings."""
+        """Sign a packet and return {sign, extra, token} as hex strings.
+
+        Serialized via a lock — wrapper.node holds global VM/PRNG state,
+        so concurrent native calls corrupt output.
+        """
         if not self._func:
             raise RuntimeError("Sign provider not loaded")
 
         out_buf = (c_ubyte * self.BUF_SIZE)()
-        src_buf = (c_ubyte * len(src)).from_buffer_copy(src)
+        src_buf = (c_ubyte * max(len(src), 1))()
+        if src:
+            ctypes.memmove(src_buf, src, len(src))
 
-        self._func(
-            cmd.encode('utf-8'),
-            ctypes.cast(src_buf, POINTER(c_ubyte)),
-            c_uint(len(src)),
-            c_int(seq),
-            ctypes.cast(out_buf, POINTER(c_ubyte)),
-        )
+        t0 = time.monotonic()
+        with self._call_lock:
+            self._func(
+                cmd.encode('utf-8'),
+                ctypes.cast(src_buf, POINTER(c_ubyte)),
+                c_uint(len(src)),
+                c_int(seq),
+                ctypes.cast(out_buf, POINTER(c_ubyte)),
+            )
+            self._call_count += 1
+        self._total_native_ms += (time.monotonic() - t0) * 1000
 
         raw = bytes(out_buf)
         token_len = raw[self.TOKEN_LEN]
@@ -272,6 +293,25 @@ class NativeSignProvider:
             "extra": raw[self.EXTRA_DATA:self.EXTRA_DATA + extra_len].hex().upper(),
             "sign": raw[self.SIGN_DATA:self.SIGN_DATA + sign_len].hex().upper(),
         }
+
+    def stats(self) -> dict:
+        avg_ms = self._total_native_ms / self._call_count if self._call_count else 0.0
+        return {
+            "call_count": self._call_count,
+            "avg_native_ms": round(avg_ms, 2),
+            "total_native_ms": round(self._total_native_ms, 2),
+        }
+
+    def self_test(self) -> None:
+        """Issue a warm-up sign call to confirm the native function is callable.
+
+        Raises if the call fails or output looks invalid.
+        """
+        result = self.sign("wtlogin.login", 1, b"\x00")
+        sign_hex = result["sign"]
+        if not sign_hex or len(sign_hex) < 8:
+            raise RuntimeError(f"Self-test failed: sign output too short ({sign_hex!r})")
+        log.info("self-test ok: sign[:16]=%s...", sign_hex[:16])
 
     @staticmethod
     def _build_libsymbols(output_path: str):
@@ -292,33 +332,54 @@ class NativeSignProvider:
 # --- HTTP Server ---
 
 def create_app(provider: NativeSignProvider, platform: str = "Linux", version: str = "3.2.27-47354"):
-    """Create Flask/HTTP app with Lagrange.Core compatible API."""
+    """Create HTTP app with Lagrange.Core compatible API."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import urllib.parse
 
+    started_at = time.time()
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        """Threaded server. The native sign() is serialized by its own lock,
+        but HTTP request handling (parsing, caching, responses) runs concurrently."""
+        daemon_threads = True
+        allow_reuse_address = True
+
     class SignHandler(BaseHTTPRequestHandler):
+        server_version = "NTQQSignServer/1.0"
+
         def do_POST(self):
             content_len = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_len)
             try:
-                params = json.loads(body)
+                params = json.loads(body) if body else {}
             except json.JSONDecodeError:
-                self.send_error(400, "Invalid JSON")
+                self._json_response({"error": "invalid JSON body"}, 400)
                 return
             self._handle_sign(params)
 
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
-            if parsed.path in ("/appinfo", "/api/sign/appinfo"):
+            path = parsed.path
+            if path in ("/appinfo", "/api/sign/appinfo"):
                 self._handle_appinfo()
+                return
+            if path in ("/health", "/healthz"):
+                self._handle_health()
+                return
+            if path in ("/stats", "/metrics"):
+                self._handle_stats()
                 return
             params = dict(urllib.parse.parse_qsl(parsed.query))
             self._handle_sign(params)
 
         def _handle_sign(self, params: dict):
             cmd = params.get("cmd", "")
-            seq = int(params.get("seq", 0))
-            src_hex = params.get("src", "")
+            try:
+                seq = int(params.get("seq", 0))
+            except (TypeError, ValueError):
+                self._json_response({"error": "seq must be int"}, 400)
+                return
+            src_hex = params.get("src", "") or ""
 
             if not cmd:
                 self._json_response({"error": "missing cmd"}, 400)
@@ -333,6 +394,7 @@ def create_app(provider: NativeSignProvider, platform: str = "Linux", version: s
             try:
                 result = provider.sign(cmd, seq, src)
             except Exception as e:
+                log.exception("sign failed for cmd=%s src_len=%d", cmd, len(src))
                 self._json_response({"error": str(e)}, 500)
                 return
 
@@ -343,9 +405,43 @@ def create_app(provider: NativeSignProvider, platform: str = "Linux", version: s
             })
 
         def _handle_appinfo(self):
+            # Full Lagrange.Core BotAppInfo schema for Linux NTQQ 3.2.x.
+            # These constants come from Lagrange.Core/Common/Interface/Api/BotAppInfo.cs
+            # and are fixed for all NTQQ Linux clients (they are NOT session-dependent).
             self._json_response({
+                "Os": "Linux",
+                "Kernel": "Linux",
+                "VendorOs": "linux",
+                "CurrentVersion": version,
+                "MiscBitmap": 32764,
+                "PTVersion": "2.0.0",
+                "SsoVersion": 19,
+                "PackageName": "com.tencent.qq",
+                "WtLoginSdk": "nt.wtlogin.0.0.1",
+                "AppId": 1600001615,
+                "SubAppId": 537341034,
+                "AppIdQrCode": 537341034,
+                "AppClientVersion": 13172,
+                "MainSigMap": 169742560,
+                "SubSigMap": 0,
+                "NTLoginType": 1,
+                # Legacy / compatibility fields kept for older consumers
                 "platform": platform,
                 "version": version,
+            })
+
+        def _handle_health(self):
+            self._json_response({
+                "status": "ok",
+                "uptime_seconds": round(time.time() - started_at, 1),
+                "platform": platform,
+                "version": version,
+            })
+
+        def _handle_stats(self):
+            self._json_response({
+                "uptime_seconds": round(time.time() - started_at, 1),
+                **provider.stats(),
             })
 
         def _json_response(self, data: dict, status: int = 200):
@@ -357,9 +453,9 @@ def create_app(provider: NativeSignProvider, platform: str = "Linux", version: s
             self.wfile.write(body)
 
         def log_message(self, format, *args):
-            print(f"[{self.log_date_time_string()}] {format % args}")
+            log.info("%s - %s", self.address_string(), format % args)
 
-    return HTTPServer, SignHandler
+    return ThreadingHTTPServer, SignHandler
 
 
 def main():
@@ -373,11 +469,30 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Listen port (default: {DEFAULT_PORT})")
     parser.add_argument("--qq-dir", default=None, help="QQ installation directory (for version detection)")
     parser.add_argument("--version", default=None, help="QQ version string (e.g. 3.2.27-47354)")
+    parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"),
+                        help="Log level: DEBUG, INFO, WARNING, ERROR")
+    parser.add_argument("--skip-self-test", action="store_true",
+                        help="Skip the startup self-test (not recommended)")
+    parser.add_argument("--hybrid", action="store_true",
+                        help="Wrap the native provider with HybridSignProvider — caches "
+                             "(X_b1_init, X_b2[1]) per (cmd, MD5(src)) so wrapper.node is "
+                             "called only once per unique input. Subsequent ctr variations "
+                             "computed in pure Python (~10-100x throughput on repeated srcs).")
+    parser.add_argument("--hybrid-cache",
+                        default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "oracle_cache.json"),
+                        help="Path to hybrid oracle cache file (default: ./oracle_cache.json)")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
 
     wrapper_path = os.path.abspath(args.wrapper)
     if not os.path.exists(wrapper_path):
-        print(f"[!] wrapper.node not found at {wrapper_path}")
+        log.error("wrapper.node not found at %s", wrapper_path)
         sys.exit(1)
 
     # Determine QQ version
@@ -391,27 +506,51 @@ def main():
     offset = args.offset
     if offset is None and qq_version and qq_version in KNOWN_OFFSETS:
         offset = KNOWN_OFFSETS[qq_version]
-        print(f"[+] Using known offset 0x{offset:x} for QQ {qq_version}")
+        log.info("using known offset 0x%x for QQ %s", offset, qq_version)
     if offset is None:
-        print(f"[*] Auto-detecting signing function offset...")
+        log.info("auto-detecting signing function offset...")
         offset = find_offset_by_pattern(wrapper_path)
         if offset:
-            print(f"[+] Auto-detected offset: 0x{offset:x}")
+            log.info("auto-detected offset: 0x%x", offset)
         else:
-            print("[!] Could not auto-detect offset. Please specify --offset")
+            log.error("could not auto-detect offset. Please specify --offset")
             sys.exit(1)
 
-    # Load and start
-    provider = NativeSignProvider(wrapper_path, offset)
-    provider.load()
+    # Load
+    native_provider = NativeSignProvider(wrapper_path, offset)
+    native_provider.load()
+
+    # Startup self-test — catches broken offsets / missing preload deps
+    if not args.skip_self_test:
+        try:
+            native_provider.self_test()
+        except Exception:
+            log.exception("startup self-test failed — refusing to serve")
+            sys.exit(2)
+
+    # Optionally wrap with hybrid cache provider
+    if args.hybrid:
+        from hybrid_sign import HybridSignProvider
+        provider = HybridSignProvider(native_provider, cache_path=args.hybrid_cache)
+        log.info("hybrid sign provider enabled (cache: %s)", args.hybrid_cache)
+    else:
+        provider = native_provider
 
     platform = "Linux"
-    version_str = qq_version or "unknown"
+    # Fall back to the version the auto-detected offset corresponds to (if known),
+    # so the /api/sign/appinfo response isn't silently stale.
+    if not qq_version:
+        for known_ver, known_off in KNOWN_OFFSETS.items():
+            if known_off == offset:
+                qq_version = known_ver
+                log.info("offset 0x%x matches known QQ version %s — using it for appinfo",
+                         offset, qq_version)
+                break
+    version_str = qq_version or "3.2.27-47354"
 
-    print(f"\n[*] Starting sign server on {args.host}:{args.port}")
-    print(f"[*] Platform: {platform}, Version: {version_str}")
-    print(f"[*] API endpoint: POST http://{args.host}:{args.port}/")
-    print(f"[*] Lagrange.Core config: SignServerUrl = http://YOUR_HOST:{args.port}/\n")
+    log.info("starting sign server on %s:%d", args.host, args.port)
+    log.info("platform=%s version=%s", platform, version_str)
+    log.info("POST http://%s:%d/ — Lagrange.Core SignServerUrl", args.host, args.port)
 
     server_class, handler_class = create_app(provider, platform, version_str)
     server = server_class((args.host, args.port), handler_class)
@@ -419,7 +558,7 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[*] Shutting down...")
+        log.info("shutting down")
         server.shutdown()
 
 

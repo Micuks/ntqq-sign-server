@@ -26,8 +26,12 @@ RUN gcc -std=c99 -shared -fPIC -o /app/libsymbols.so /app/symbols.c
 
 COPY sign.py /app/
 
-ENV LD_LIBRARY_PATH=/app
+ENV LD_LIBRARY_PATH=/app \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
 
 CMD ["python3", "/app/sign.py", "--wrapper", "/app/wrapper.node", "--host", "0.0.0.0", "--port", "8080"]
