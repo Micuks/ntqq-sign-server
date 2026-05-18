@@ -10,6 +10,10 @@ libcrbase.so
 __pycache__/
 *.pyc
 
+# Local reverse-engineering / experimental scratch — kept out of remote
+analysis/
+.codex
+
 # IDA Pro database files
 *.id0
 *.id1
