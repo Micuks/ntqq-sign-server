@@ -27,9 +27,16 @@ import hashlib
 import json
 import os
 import threading
+import time
 from typing import Optional
 
 import pure_cipher
+
+# Process-global lock serializing wrapper.node native calls.
+# wrapper.node holds global VM / MK / PRNG state; concurrent invocations
+# corrupt the output. Shared across all _NativeSign instances so that, even
+# if multiple providers exist, native calls remain strictly serialized.
+_NATIVE_CALL_LOCK = threading.Lock()
 
 # ----------------------------------------------------------------------------
 # Native wrapper loader (no Frida required — pure ctypes).
@@ -91,13 +98,21 @@ class _NativeSign:
 
         The output buffer is 0x300 bytes: 0x000..0x0FF = token (length at 0x0FF),
         0x100..0x1FF = extra (length at 0x1FF), 0x200..0x2FF = sign (length at 0x2FF).
+
+        seq (4th arg) is empirically a no-op cipher-side when ctr is held
+        constant; native sign output is fully determined by (cmd, src, ctr).
+        We pass seq=1 for reproducibility. src=b"" is passed with len=0 and a
+        1-byte zero scratch buffer (matches NativeSignProvider.sign), so an
+        empty payload is distinct from a 1-byte 0x00 payload.
         """
-        if not src:
-            src = b"\x00"
-        sb = (ctypes.c_ubyte * len(src))(*src)
+        if src:
+            sb = (ctypes.c_ubyte * len(src))(*src)
+        else:
+            sb = (ctypes.c_ubyte * 1)()  # scratch — won't be read at len=0
         out = (ctypes.c_ubyte * 0x300)()
-        ctypes.c_uint32.from_address(self._counter_addr).value = ctr
-        self._sf(cmd, sb, len(src), 1, out)
+        with _NATIVE_CALL_LOCK:
+            ctypes.c_uint32.from_address(self._counter_addr).value = ctr
+            self._sf(cmd, sb, len(src), 1, out)
         raw = bytes(out)
         token_len = raw[0xFF]
         extra_len = raw[0x1FF]
@@ -126,10 +141,15 @@ class NoFridaSignProvider:
         self._cache_path: str = cache_path or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "no_frida_cache.json")
         self._lock = threading.Lock()
+        # Per-key in-progress condvars — when two threads ask for the same
+        # cold key simultaneously, only the first issues the native call; the
+        # rest wait here for the entry to land in the cache.
+        self._in_progress: dict = {}
         self._cache: dict = {}
         self._native: Optional[_NativeSign] = None
         self._native_calls = 0
         self._cache_hits = 0
+        self._total_native_ms = 0.0
         self._load_cache()
 
     def _load_cache(self):
@@ -161,7 +181,10 @@ class NoFridaSignProvider:
 
         Compatible with sign.NativeSignProvider.sign signature minus the seq arg's
         impact: seq is unused for the cipher (X_b1_init/X_b2[1] don't depend on
-        seq); ctr controls X_b2[0] high 16 bits. Caller may pass any seq value.
+        seq, and the round-key schedule does not depend on seq either —
+        empirically verified by varying seq with ctr held constant: byte-identical
+        sign across seq=1, 2, 3, 100, 12345). ctr controls X_b2[0] high 16 bits.
+        Caller may pass any seq value.
         """
         result = self._sign_internal(cmd, src, ctr)
         return {
@@ -170,16 +193,44 @@ class NoFridaSignProvider:
             "token": result["token"].hex().upper(),
         }
 
+    def _cache_key(self, cmd: str, src: bytes) -> str:
+        """Distinguish empty src from a 1-byte 0x00 src — native treats them
+        differently (passes len=0 vs len=1), so they MUST live under distinct
+        cache keys. We tag empty as the literal token 'empty' to make this
+        unambiguous (and avoid colliding with md5(b'') which is a real hash)."""
+        if not src:
+            return f"{cmd}|empty"
+        return f"{cmd}|{hashlib.md5(src).hexdigest()}"
+
     def _sign_internal(self, cmd: str, src: bytes, ctr: int) -> dict:
         cmd_b = cmd.encode() if isinstance(cmd, str) else cmd
-        if not src:
-            src = b"\x00"
-        md5 = hashlib.md5(src).hexdigest()
-        key = f"{cmd}|{md5}"
+        key = self._cache_key(cmd, src)
+        # Critical section: check cache, and if cold, reserve the key so other
+        # threads asking for the same key wait instead of racing into _populate.
+        populate_owner = False
         with self._lock:
             entry = self._cache.get(key)
+            if entry is None:
+                cv = self._in_progress.get(key)
+                if cv is None:
+                    cv = threading.Condition(self._lock)
+                    self._in_progress[key] = cv
+                    populate_owner = True
+                else:
+                    # Wait until the owner finishes populating (or fails).
+                    while key not in self._cache and key in self._in_progress:
+                        cv.wait()
+                    entry = self._cache.get(key)
+        if populate_owner and entry is None:
+            try:
+                entry = self._populate(cmd_b, src, key)
+            finally:
+                with self._lock:
+                    cv = self._in_progress.pop(key, None)
+                    if cv is not None:
+                        cv.notify_all()
         if entry is None:
-            entry = self._populate(cmd_b, src, key)
+            raise RuntimeError(f"populate failed for key={key}")
         self._cache_hits += 1
         token_b = bytes.fromhex(entry.get("token", ""))
         extra_b = bytes.fromhex(entry.get("extra", ""))
@@ -200,7 +251,9 @@ class NoFridaSignProvider:
         assert self._native is not None
         # Fixed bootstrap ctr — reproducible and avoids ctr-dependent recovery edge cases.
         bootstrap_ctr = 100
+        t0 = time.monotonic()
         full = self._native.sign_full(cmd, src, ctr=bootstrap_ctr)
+        self._total_native_ms += (time.monotonic() - t0) * 1000.0
         sig = full["sign"]
         self._native_calls += 1
         if len(sig) != 32:
@@ -221,10 +274,17 @@ class NoFridaSignProvider:
 
     @property
     def stats(self) -> dict:
+        avg_ms = (self._total_native_ms / self._native_calls) if self._native_calls else 0.0
+        # Both "native_calls" (clearer naming for the pure-Python server) and
+        # "call_count" (compat with sign.py's stats() schema) are reported so
+        # this provider is drop-in compatible with sign.py's /stats consumers.
         return {
             "native_calls": self._native_calls,
+            "call_count": self._native_calls,
             "cache_hits": self._cache_hits,
             "cache_size": len(self._cache),
+            "total_native_ms": round(self._total_native_ms, 2),
+            "avg_native_ms": round(avg_ms, 2),
         }
 
 

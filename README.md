@@ -43,8 +43,27 @@ python3 pure_sign_server.py --port 8080 --prewarm wtlogin.login \
     trpc.qq_new_tech.status_svc.SsoHeartBeat
 ```
 
-Same HTTP API as `sign.py`. See `/stats` for `native_calls` vs `cache_hits`.
+Same HTTP API as `sign.py`. `/stats` exports both `native_calls`/`cache_hits`
+(pure-server-specific) and `call_count`/`avg_native_ms` (sign.py-compatible).
 Adds `ctr` query/body parameter (default `100`) — controls X_b2[0] high 16 bits.
+
+**`seq` is accepted for API compatibility but does not influence the sign**:
+empirically the native cipher output is determined entirely by `(cmd, src, ctr)`
+when `ctr` is held constant (verified across seq=1, 2, 3, 100, 12345 — byte-identical
+output). This matches the `--hybrid` behavior in `sign.py`. Existing `sign.py`
+deployments appear seq-dependent only because they let the native module's
+internal counter drift between calls; the pure server makes `ctr` explicit
+per-request, so callers managing their own sequence/counter mapping retain full
+control of sign uniqueness.
+
+**Cache key**: `(cmd, md5(src))` for non-empty src, `(cmd, "empty")` for empty
+src — `b""` is intentionally distinct from `b"\x00"` (the native call passes
+`len=0` vs `len=1` and produces different signs accordingly).
+
+**Thread safety**: Concurrent HTTP requests are serialized across native calls
+via a process-global lock; concurrent requests for the same cold cache key
+issue exactly one native call (others wait on a per-key condvar). The
+single-flight property holds even under heavy parallel cold load.
 
 ### Docker
 

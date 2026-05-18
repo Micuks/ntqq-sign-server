@@ -42,19 +42,69 @@ def create_handler(provider: NoFridaSignProvider, platform: str, version: str, s
     class SignHandler(BaseHTTPRequestHandler):
         server_version = "NTQQPureSignServer/1.0"
 
+        def _read_body(self) -> bytes:
+            # Lagrange.OneBot (Go HTTP client) sends sign POSTs with
+            # Transfer-Encoding: chunked and no Content-Length. Python's
+            # BaseHTTPRequestHandler doesn't decode chunked, so without this
+            # we'd see 0-byte bodies and 400 every request.
+            te = self.headers.get("Transfer-Encoding", "").lower()
+            if "chunked" in te:
+                body = bytearray()
+                while True:
+                    line = self.rfile.readline()
+                    if not line:
+                        break
+                    # chunk size line: "<hex>[;<ext>]\r\n"
+                    size_str = line.split(b";", 1)[0].strip()
+                    try:
+                        size = int(size_str, 16)
+                    except ValueError:
+                        break
+                    if size == 0:
+                        # consume trailing headers + final CRLF
+                        while True:
+                            t = self.rfile.readline()
+                            if not t or t in (b"\r\n", b"\n"):
+                                break
+                        break
+                    chunk = self.rfile.read(size)
+                    body.extend(chunk)
+                    self.rfile.readline()  # CRLF after chunk data
+                return bytes(body)
+            cl = int(self.headers.get("Content-Length", 0))
+            return self.rfile.read(cl) if cl else b""
+
+        def _split_path_query(self):
+            # Collapse any leading double-slashes BEFORE urlparse — Lagrange
+            # concatenates its configured SignServerUrl (ends with '/') with
+            # sub-paths like '/appinfo', producing '//appinfo'. urlparse on
+            # '//appinfo' misreads 'appinfo' as netloc and returns path=''.
+            raw = self.path
+            while raw.startswith("//"):
+                raw = raw[1:]
+            if "?" in raw:
+                path, _, query = raw.partition("?")
+            else:
+                path, query = raw, ""
+            return path, query
+
         def do_POST(self):
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_len) if content_len else b""
-            try:
-                params = json.loads(body) if body else {}
-            except json.JSONDecodeError:
-                self._json({"error": "invalid JSON body"}, 400)
+            body = self._read_body()
+            params: dict = {}
+            if body:
+                try:
+                    params = json.loads(body)
+                except json.JSONDecodeError:
+                    self._json({"error": "invalid JSON body"}, 400)
+                    return
+            path, _ = self._split_path_query()
+            if path in ("/appinfo", "/api/sign/appinfo"):
+                self._handle_appinfo()
                 return
             self._handle_sign(params)
 
         def do_GET(self):
-            parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path
+            path, query = self._split_path_query()
             if path in ("/appinfo", "/api/sign/appinfo"):
                 self._handle_appinfo()
                 return
@@ -72,7 +122,7 @@ def create_handler(provider: NoFridaSignProvider, platform: str, version: str, s
                     **provider.stats,
                 })
                 return
-            params = dict(urllib.parse.parse_qsl(parsed.query))
+            params = dict(urllib.parse.parse_qsl(query))
             self._handle_sign(params)
 
         def _handle_sign(self, params: dict):
